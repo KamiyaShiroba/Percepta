@@ -1,0 +1,14 @@
+The Companion Mode wire format used by Percepta was documented by:
+
+- clipremote, MIT License, Copyright (c) 2023 Henry Stark
+  https://github.com/chocolatkey/clipremote
+- ok-picker-csp, MIT License, Copyright (c) 2026 luapwastaken
+  https://github.com/luapwastaken/ok-picker-csp
+
+assets/settings.svg is from Tabler Icons, MIT License,
+Copyright (c) 2020-2024 Paweł Kuna
+https://github.com/tabler/tabler-icons
+
+Clip Studio Paint is a product of CELSYS, Inc. Percepta is not affiliated with
+or endorsed by CELSYS. Companion Mode is undocumented and may change with any
+Clip Studio Paint update.
