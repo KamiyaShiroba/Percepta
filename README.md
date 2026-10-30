@@ -75,4 +75,8 @@ cargo build --release
 
 详细的来源和许可证信息见 [NOTICE](NOTICE)。
 
+## 许可证
+
+[MIT](LICENSE)。
+
 CLIP STUDIO PAINT 是 CELSYS, Inc. 的产品。Percepta 是个人项目，和 CELSYS 没有任何关系，也没有得到他们的认可。

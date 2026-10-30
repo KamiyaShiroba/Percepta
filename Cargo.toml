@@ -3,6 +3,7 @@ name = "percepta"
 version = "1.0.0-alpha"
 edition = "2021"
 description = "Colour picker for Clip Studio Paint, connected over Companion Mode"
+license = "MIT"
 
 [dependencies]
 eframe = "0.37"
