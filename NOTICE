@@ -9,6 +9,10 @@ assets/settings.svg is from Tabler Icons, MIT License,
 Copyright (c) 2020-2024 Paweł Kuna
 https://github.com/tabler/tabler-icons
 
+installer/ChineseSimplified.isl is from Inno Setup's source repository, by
+Zhenghan Yang (Kira), and is covered by the Inno Setup License
+https://github.com/jrsoftware/issrc
+
 Clip Studio Paint is a product of CELSYS, Inc. Percepta is not affiliated with
 or endorsed by CELSYS. Companion Mode is undocumented and may change with any
 Clip Studio Paint update.

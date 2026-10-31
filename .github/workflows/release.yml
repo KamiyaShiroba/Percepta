@@ -1,0 +1,42 @@
+# Pushing a tag like v1.0.0 publishes that version, and every installed Percepta will
+# then offer it as an update. The tag must match the version in Cargo.toml.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version"
+          }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          iscc "/DAppVersion=$env:VERSION" installer\percepta.iss
+
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $prerelease = if ($env:VERSION -match '-') { '--prerelease' } else { '--latest' }
+          gh release create $env:GITHUB_REF_NAME "target\installer\Percepta-Setup-$env:VERSION.exe" --generate-notes $prerelease

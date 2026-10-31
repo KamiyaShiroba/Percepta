@@ -32,6 +32,19 @@ pub struct SavedColors {
     pub sub: Rgb,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedSettings {
+    pub restore_csp: bool,
+    pub check_updates: bool,
+}
+
+impl Default for SavedSettings {
+    fn default() -> Self {
+        Self { restore_csp: true, check_updates: true }
+    }
+}
+
 fn path() -> Option<PathBuf> {
     let dir = std::env::var_os("APPDATA")?;
     Some(PathBuf::from(dir).join("Percepta").join("session.json"))
@@ -78,6 +91,14 @@ pub fn load_layout() -> Option<SavedLayout> {
 
 pub fn save_layout(layout: &SavedLayout) -> Result<(), String> {
     save_json("layout.json", layout)
+}
+
+pub fn load_settings() -> SavedSettings {
+    load_json("settings.json").unwrap_or_default()
+}
+
+pub fn save_settings(settings: &SavedSettings) -> Result<(), String> {
+    save_json("settings.json", settings)
 }
 
 /// Keeps a record of the connection that outlives the app, because drops are too

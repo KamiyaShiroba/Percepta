@@ -375,6 +375,13 @@ fn ring_pixels(model: Model, size: usize, inner: f32) -> Vec<u8> {
     pixels
 }
 
+/// Tight enough for all five slider tabs to fit the narrowest window. The wheel's
+/// tabs match them.
+fn tighten_tabs(ui: &mut egui::Ui) {
+    ui.spacing_mut().item_spacing.x = TAB_SPACING;
+    ui.spacing_mut().button_padding.x = TAB_PADDING;
+}
+
 /// A modern on/off switch. Reports a change through `Response::changed`.
 pub fn switch(ui: &mut egui::Ui, on: &mut bool, label: &str) -> Response {
     ui.horizontal(|ui| {
@@ -514,6 +521,7 @@ impl Picker {
     pub fn wheel_panel(&mut self, ui: &mut egui::Ui, color: &mut ColorState) -> bool {
         self.end_hue_drag_on_release(ui);
         ui.horizontal(|ui| {
+            tighten_tabs(ui);
             for (model, name) in WHEEL_MODELS {
                 ui.selectable_value(&mut self.wheel_model, model, name);
             }
@@ -540,9 +548,7 @@ impl Picker {
         self.end_hue_drag_on_release(ui);
         let mut changed = false;
         ui.horizontal(|ui| {
-            // Tight enough for all five tabs to fit the narrowest window.
-            ui.spacing_mut().item_spacing.x = TAB_SPACING;
-            ui.spacing_mut().button_padding.x = TAB_PADDING;
+            tighten_tabs(ui);
             for (tab, name) in SLIDER_TABS {
                 ui.selectable_value(&mut self.slider_tab, tab, name);
             }
@@ -979,6 +985,47 @@ fn draw_track(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One image of an .ico: a bottom-up BGRA bitmap, double height for the mask that
+    /// follows it. The mask stays empty, as the alpha channel already says it all.
+    fn ico_image(size: usize) -> Vec<u8> {
+        let header_size = 40u32;
+        let mut image = Vec::new();
+        image.extend_from_slice(&header_size.to_le_bytes());
+        image.extend_from_slice(&(size as i32).to_le_bytes());
+        image.extend_from_slice(&(size as i32 * 2).to_le_bytes());
+        image.extend_from_slice(&1u16.to_le_bytes());
+        image.extend_from_slice(&32u16.to_le_bytes());
+        image.resize(header_size as usize, 0);
+        for row in app_icon_pixels(size).chunks_exact(size * 4).rev() {
+            for pixel in row.chunks_exact(4) {
+                image.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+            }
+        }
+        let mask_row = size.div_ceil(32) * 4;
+        image.resize(image.len() + mask_row * size, 0);
+        image
+    }
+
+    /// Run after changing the icon: the exe and the installer embed the file.
+    #[test]
+    #[ignore = "writes assets/percepta.ico"]
+    fn write_exe_icon() {
+        const SIZES: [usize; 7] = [16, 24, 32, 48, 64, 128, 256];
+        let images = SIZES.map(ico_image);
+        let mut file = vec![0, 0, 1, 0];
+        file.extend_from_slice(&(SIZES.len() as u16).to_le_bytes());
+        let mut offset = 6 + 16 * SIZES.len();
+        for (size, image) in SIZES.iter().zip(&images) {
+            // A stored size of 0 means 256.
+            file.extend_from_slice(&[*size as u8, *size as u8, 0, 0, 1, 0, 32, 0]);
+            file.extend_from_slice(&(image.len() as u32).to_le_bytes());
+            file.extend_from_slice(&(offset as u32).to_le_bytes());
+            offset += image.len();
+        }
+        file.extend(images.concat());
+        std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/percepta.ico"), file).unwrap();
+    }
 
     #[test]
     fn inner_axes_match_each_model() {

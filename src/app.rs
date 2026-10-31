@@ -15,7 +15,8 @@ use crate::csp::worker::{Command, Event, Worker};
 use crate::csp::{Rgb, Slot};
 use crate::picker::{app_icon_pixels, switch, IconButton, Picker};
 use crate::platform::{click_csp_title_bar, pen_or_mouse_down, PaletteWindow};
-use crate::session::{SavedColors, SavedLayout};
+use crate::session::{SavedColors, SavedLayout, SavedSettings};
+use crate::update::{self, Updater};
 use crate::{qr, session};
 
 /// A read-back matching a colour sent this recently is our own echo, not an edit
@@ -58,6 +59,8 @@ const CHECKER_SIZE: f32 = 6.0;
 const CHECKER_LIGHT: Color32 = Color32::from_gray(235);
 const CHECKER_DARK: Color32 = Color32::from_gray(190);
 const ACTIVE_SLOT_WIDTH: f32 = 2.0;
+/// The mark on the settings button when an update is waiting.
+const UPDATE_DOT_RADIUS: f32 = 3.0;
 
 /// Things are saved once they stop changing, not on every step of a drag.
 const SAVE_DELAY: Duration = Duration::from_secs(1);
@@ -172,7 +175,9 @@ pub struct App {
     typing: bool,
     /// The window has actually become active since typing started.
     typing_active: bool,
-    restore_csp: bool,
+    settings: SavedSettings,
+    saved_settings: Saved<SavedSettings>,
+    updater: Updater,
     restore_at: Option<Instant>,
     last_restore: Option<Instant>,
 
@@ -235,11 +240,18 @@ impl App {
             }
             window.follow_csp();
         }
+        let settings = session::load_settings();
+        let mut updater = Updater::new();
+        if settings.check_updates {
+            updater.check(&cc.egui_ctx);
+        }
         let mut app = Self {
             window,
             typing: false,
             typing_active: false,
-            restore_csp: true,
+            settings,
+            saved_settings: Saved::new(settings),
+            updater,
             restore_at: None,
             last_restore: None,
             link: Link::Idle,
@@ -287,6 +299,9 @@ impl App {
         if self.saved_layout.is_due(layout, ctx) {
             self.save_layout(layout);
         }
+        if self.saved_settings.is_due(self.settings, ctx) {
+            self.save_settings();
+        }
     }
 
     fn current_layout(&self) -> SavedLayout {
@@ -311,6 +326,13 @@ impl App {
         self.saved_layout.written(layout);
         if let Err(e) = session::save_layout(&layout) {
             self.log(format!("保存窗口布局失败：{e}"));
+        }
+    }
+
+    fn save_settings(&mut self) {
+        self.saved_settings.written(self.settings);
+        if let Err(e) = session::save_settings(&self.settings) {
+            self.log(format!("保存设置失败：{e}"));
         }
     }
 
@@ -478,7 +500,7 @@ impl App {
     /// After the pen lifts from this window, hands CSP and the tablet driver
     /// the title bar click that makes them resume.
     fn sync_csp_restore(&mut self, ctx: &egui::Context) {
-        if !self.restore_csp || self.typing {
+        if !self.settings.restore_csp || self.typing {
             self.restore_at = None;
             return;
         }
@@ -672,8 +694,13 @@ impl App {
             ui.painter().circle_filled(dot.center(), STATUS_DOT_SIZE / 2.0, color);
             ui.label(RichText::new(text).color(color));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.settings_icon.show(ui, self.settings_open, "设置") {
+                let update_waiting = matches!(self.updater.state, update::State::Available(_));
+                let hover_text = if update_waiting { "设置（有新版本）" } else { "设置" };
+                if self.settings_icon.show(ui, self.settings_open, hover_text) {
                     self.settings_open = true;
+                }
+                if update_waiting {
+                    ui.painter().circle_filled(ui.min_rect().right_top(), UPDATE_DOT_RADIUS, CONNECTED);
                 }
                 if self.color.gamut_mapped {
                     ui.label(RichText::new("已映射").color(WARNING)).on_hover_text("超出 sRGB，已映射到色域内");
@@ -698,7 +725,7 @@ impl App {
         ui.add_space(4.0);
         ui.label(RichText::new("连接 CSP").strong());
         self.connection_ui(ui);
-        switch(ui, &mut self.restore_csp, "抬笔后自动点击 CSP 标题栏")
+        switch(ui, &mut self.settings.restore_csp, "抬笔后自动点击 CSP 标题栏")
             .on_hover_text("修复用笔操作取色器后，数位板按键映射错误和笔刷光标卡住的问题");
         ui.separator();
 
@@ -710,6 +737,10 @@ impl App {
         if ui.button("重新读取").on_hover_text("在 CSP 里改了配置文件后使用").clicked() {
             self.picker.reload_cmyk_profile();
         }
+        ui.separator();
+
+        ui.label(RichText::new("更新").strong());
+        self.update_ui(ui);
         ui.separator();
 
         egui::CollapsingHeader::new("诊断").show(ui, |ui| {
@@ -726,6 +757,52 @@ impl App {
         if ui.button("关闭").clicked() {
             self.settings_open = false;
         }
+    }
+
+    fn update_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ui.label(format!("当前版本：{}", update::CURRENT_VERSION));
+        let mut install = None;
+        let mut check = false;
+        match &self.updater.state {
+            update::State::Idle => check = ui.button("检查更新").clicked(),
+            update::State::Checking => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("正在检查…");
+                });
+            }
+            update::State::UpToDate => {
+                ui.label("已经是最新版本");
+                check = ui.button("检查更新").clicked();
+            }
+            update::State::Available(release) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("有新版本 {}", release.version)).color(CONNECTED));
+                    ui.hyperlink_to("更新内容", &release.page);
+                });
+                if ui.button("下载并安装").on_hover_text("Percepta 会关闭，装好后自动重新打开").clicked() {
+                    install = Some(release.clone());
+                }
+            }
+            update::State::Downloading(fraction) => {
+                ui.add(egui::ProgressBar::new(*fraction).text("正在下载…"));
+            }
+            update::State::Installing => {
+                ui.label("正在安装…");
+            }
+            update::State::Failed(reason) => {
+                ui.label(RichText::new(reason).color(WARNING));
+                check = ui.button("重新检查").clicked();
+            }
+        }
+        if check {
+            self.updater.check(&ctx);
+        }
+        if let Some(release) = install {
+            self.updater.install(&ctx, release);
+        }
+        switch(ui, &mut self.settings.check_updates, "启动时检查更新").on_hover_text("只会联网询问 GitHub 有没有新版本");
     }
 
     fn stats_ui(&self, ui: &mut egui::Ui) {
@@ -750,6 +827,9 @@ impl Drop for App {
         if layout != self.saved_layout.on_disk {
             self.save_layout(layout);
         }
+        if self.settings != self.saved_settings.on_disk {
+            self.save_settings();
+        }
     }
 }
 
@@ -761,6 +841,10 @@ impl eframe::App for App {
         self.sync_keyboard(&ctx);
         self.sync_csp_restore(&ctx);
         self.sync_saved_state(&ctx);
+        self.updater.poll();
+        if matches!(self.updater.state, update::State::Installing) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -777,9 +861,9 @@ impl eframe::App for App {
 
         if self.settings_open {
             let modal = egui::Modal::new(ui.scope_id().with("settings")).show(&ctx, |ui| {
-                let room = ui.ctx().content_rect().width() - SETTINGS_WINDOW_MARGIN;
-                ui.set_width(SETTINGS_WIDTH.min(room));
-                self.settings_ui(ui);
+                let room = ui.ctx().content_rect().size() - egui::Vec2::splat(SETTINGS_WINDOW_MARGIN);
+                ui.set_width(SETTINGS_WIDTH.min(room.x));
+                egui::ScrollArea::vertical().max_height(room.y).show(ui, |ui| self.settings_ui(ui));
             });
             if modal.should_close() {
                 self.settings_open = false;

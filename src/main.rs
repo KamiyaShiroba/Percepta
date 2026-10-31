@@ -8,6 +8,7 @@ mod picker;
 mod platform;
 mod qr;
 mod session;
+mod update;
 
 const ICON_SIZE: u32 = 256;
 
