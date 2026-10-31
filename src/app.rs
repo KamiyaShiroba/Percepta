@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use eframe::egui::text_selection::LabelSelectionState;
 use eframe::egui::{self, Color32, RichText};
 
 use crate::color::ColorState;
@@ -13,9 +14,11 @@ use crate::csp::auth::{parse_qr_url, Pairing};
 use crate::csp::client::CspSlots;
 use crate::csp::worker::{Command, Event, Worker};
 use crate::csp::{Rgb, Slot};
+use crate::frame::{self, CORNER_RADIUS, TITLE_BAR_HEIGHT, TITLE_BUTTON_WIDTH};
 use crate::picker::{app_icon_pixels, switch, IconButton, Picker};
-use crate::platform::{click_csp_title_bar, pen_or_mouse_down, PaletteWindow};
-use crate::session::{SavedColors, SavedLayout, SavedSettings};
+use crate::platform::{self, click_csp_title_bar, pen_or_mouse_down, PaletteWindow};
+use crate::session::{CloseAction, SavedColors, SavedLayout, SavedSettings};
+use crate::tray::{self, Tray};
 use crate::update::{self, Updater};
 use crate::{qr, session};
 
@@ -39,7 +42,9 @@ const WARNING: Color32 = Color32::from_rgb(220, 160, 60);
 const SLOT_HOLD: Duration = Duration::from_millis(300);
 /// Relative widths of the foreground, background and transparent slots.
 const SLOT_WIDTHS: [f32; 3] = [5.0, 2.0, 2.0];
-const SLOT_CHIP_HEIGHT: f32 = 32.0;
+const MIN_SLOT_CHIP_HEIGHT: f32 = 18.0;
+/// Below the colour slots, the row with the HEX field.
+const HEX_ROW_ROOM: f32 = 25.0;
 const SLOT_CHIP_GAP: f32 = 6.0;
 /// The active slot's outline sits around the colour, with this much room for it.
 const SLOT_OUTLINE_ROOM: f32 = 3.0;
@@ -49,12 +54,33 @@ const STATUS_DOT_SIZE: f32 = 9.0;
 const CONNECTED: Color32 = Color32::from_rgb(70, 180, 100);
 const WAITING: Color32 = Color32::from_rgb(205, 180, 40);
 const DISCONNECTED: Color32 = Color32::from_gray(150);
-const SETTINGS_WIDTH: f32 = 290.0;
-/// Room left around the settings box, including its own padding and shadow.
-const SETTINGS_WINDOW_MARGIN: f32 = 32.0;
+const SETTINGS_TITLE: &str = "Percepta 设置";
+const SETTINGS_SIZE: [f32; 2] = [320.0, 520.0];
+const SETTINGS_MIN_SIZE: [f32; 2] = [240.0, 300.0];
+/// A hidden window only needs to keep up with CSP's reports now and then.
+const HIDDEN_REPAINT_INTERVAL: Duration = Duration::from_secs(1);
+const TITLE_BAR_FILL: Color32 = Color32::from_gray(232);
+const TITLE_TEXT: Color32 = Color32::from_gray(90);
+const TITLE_FONT_SIZE: f32 = 12.0;
+const WINDOW_EDGE: Color32 = Color32::from_gray(150);
+const WINDOW_EDGE_WIDTH: f32 = 1.0;
+const CONTENT_MARGIN: f32 = 8.0;
+const PANEL_PADDING: f32 = 3.0;
+/// How far from the line between two panels it can be grabbed.
+const SPLITTER_GRAB: f32 = 4.0;
+const SPLITTER_ACTIVE: Color32 = Color32::from_gray(120);
+const PANEL_COUNT: usize = 3;
+/// The colour slots, the wheel and the sliders.
+const MIN_PANEL_HEIGHTS: [f32; PANEL_COUNT] = [60.0, 200.0, 150.0];
+const DEFAULT_PANEL_HEIGHTS: [f32; PANEL_COUNT] = [72.0, 340.0, 160.0];
+pub const DEFAULT_WINDOW_HEIGHT: f32 =
+    TITLE_BAR_HEIGHT + DEFAULT_PANEL_HEIGHTS[0] + DEFAULT_PANEL_HEIGHTS[1] + DEFAULT_PANEL_HEIGHTS[2];
+pub const MIN_WINDOW_HEIGHT: f32 =
+    TITLE_BAR_HEIGHT + MIN_PANEL_HEIGHTS[0] + MIN_PANEL_HEIGHTS[1] + MIN_PANEL_HEIGHTS[2];
 /// Room beside the address field for its button.
 const CONNECT_BUTTON_ROOM: f32 = 52.0;
 const LOG_HEIGHT: f32 = 160.0;
+const CLOSE_DIALOG_WIDTH: f32 = 220.0;
 const CHECKER_SIZE: f32 = 6.0;
 const CHECKER_LIGHT: Color32 = Color32::from_gray(235);
 const CHECKER_DARK: Color32 = Color32::from_gray(190);
@@ -65,6 +91,7 @@ const UPDATE_DOT_RADIUS: f32 = 3.0;
 /// Things are saved once they stop changing, not on every step of a drag.
 const SAVE_DELAY: Duration = Duration::from_secs(1);
 const SETTINGS_ICON: &str = include_str!("../assets/settings.svg");
+const CLOSE_ICON: &str = include_str!("../assets/close.svg");
 
 /// A value that is written to disk some time after it last changed.
 struct Saved<T> {
@@ -170,11 +197,24 @@ enum ScanResult {
     Failed(String),
 }
 
-pub struct App {
-    window: Option<PaletteWindow>,
+/// A window's turn with the keyboard, which it otherwise leaves to CSP.
+#[derive(Default)]
+struct LentKeyboard {
     typing: bool,
     /// The window has actually become active since typing started.
-    typing_active: bool,
+    active: bool,
+    /// The user went off to another program, where their click has done the restoring.
+    left: bool,
+    /// The user pressed on the other window, which can't take the keyboard by that alone.
+    end_requested: bool,
+}
+
+pub struct App {
+    window: Option<PaletteWindow>,
+    keyboard: LentKeyboard,
+    settings_keyboard: LentKeyboard,
+    /// Typing ended without the user leaving, so CSP needs the click that makes it resume.
+    restore_after_typing: bool,
     settings: SavedSettings,
     saved_settings: Saved<SavedSettings>,
     updater: Updater,
@@ -199,7 +239,22 @@ pub struct App {
     saved_slots: Saved<Slots>,
     saved_layout: Saved<SavedLayout>,
     settings_open: bool,
+    /// The settings window, once it has been found and given its frame.
+    settings_hwnd: Option<isize>,
+    settings_position: Option<[i32; 2]>,
+    settings_offset: Option<[i32; 2]>,
+    settings_size: Option<[i32; 2]>,
     settings_icon: IconButton,
+    /// One for each window, as they can sit on monitors of different scales.
+    close_icon: IconButton,
+    settings_close_icon: IconButton,
+    tray: Option<Tray>,
+    close_dialog_open: bool,
+    /// Set once the app is really going, so that closing no longer goes to the tray.
+    quitting: bool,
+    confirm_update: bool,
+    panel_heights: [f32; PANEL_COUNT],
+    dragging_splitter: bool,
 
     blocked: bool,
     csp_in_front: bool,
@@ -231,10 +286,20 @@ impl App {
         let window = PaletteWindow::new(cc);
         let mut picker = Picker::default();
         let (wheel, slider) = picker.modes();
-        let layout = session::load_layout().unwrap_or(SavedLayout { position: None, size: None, wheel, slider });
+        let layout =
+            session::load_layout().unwrap_or(SavedLayout {
+                position: None,
+                size: None,
+                wheel,
+                slider,
+                panels: None,
+                settings_offset: None,
+                settings_size: None,
+            });
         picker.set_modes(layout.wheel, layout.slider);
+        let panel_heights = layout.panels.map_or(DEFAULT_PANEL_HEIGHTS, |heights| heights.map(|height| height as f32));
+        let tray = Tray::new(&cc.egui_ctx, app_icon_pixels);
         if let Some(window) = &window {
-            window.set_icon(app_icon_pixels);
             if let Some(position) = layout.position {
                 window.restore_placement(position, layout.size);
             }
@@ -247,8 +312,9 @@ impl App {
         }
         let mut app = Self {
             window,
-            typing: false,
-            typing_active: false,
+            keyboard: LentKeyboard::default(),
+            settings_keyboard: LentKeyboard::default(),
+            restore_after_typing: false,
             settings,
             saved_settings: Saved::new(settings),
             updater,
@@ -270,7 +336,19 @@ impl App {
             saved_slots: Saved::new(slots),
             saved_layout: Saved::new(layout),
             settings_open: false,
+            settings_hwnd: None,
+            settings_position: None,
+            settings_offset: layout.settings_offset,
+            settings_size: layout.settings_size,
             settings_icon: IconButton::new(SETTINGS_ICON),
+            close_icon: IconButton::new(CLOSE_ICON),
+            settings_close_icon: IconButton::new(CLOSE_ICON),
+            tray,
+            close_dialog_open: false,
+            quitting: false,
+            confirm_update: false,
+            panel_heights,
+            dragging_splitter: false,
             blocked: false,
             csp_in_front: true,
             generation: String::new(),
@@ -312,7 +390,16 @@ impl App {
             Some((position, size)) => (Some(position), Some(size)),
             None => (saved.position, saved.size),
         };
-        SavedLayout { position, size, wheel, slider }
+        let panels = self.panel_heights.map(|height| height.round() as i32);
+        SavedLayout {
+            position,
+            size,
+            wheel,
+            slider,
+            panels: Some(panels),
+            settings_offset: self.settings_offset,
+            settings_size: self.settings_size,
+        }
     }
 
     fn save_colors(&mut self) {
@@ -348,7 +435,11 @@ impl App {
         self.link = Link::Connecting;
         let ctx = ctx.clone();
         self.worker = Some(Worker::spawn(pairing, reconnect, self.event_tx.clone(), move || {
-            ctx.request_repaint()
+            if platform::is_cloaked() {
+                ctx.request_repaint_after(HIDDEN_REPAINT_INTERVAL);
+            } else {
+                ctx.request_repaint();
+            }
         }));
     }
 
@@ -500,11 +591,12 @@ impl App {
     /// After the pen lifts from this window, hands CSP and the tablet driver
     /// the title bar click that makes them resume.
     fn sync_csp_restore(&mut self, ctx: &egui::Context) {
-        if !self.settings.restore_csp || self.typing {
+        let finished = frame::take_drag_end() | std::mem::take(&mut self.restore_after_typing);
+        if !self.settings.restore_csp || self.keyboard.typing || self.settings_keyboard.typing {
             self.restore_at = None;
             return;
         }
-        let (released, down) = ctx.input(|i| (i.pointer.any_released(), i.pointer.any_down()));
+        let (released, down) = ctx.input(|i| (i.pointer.any_released() || finished, i.pointer.any_down()));
         if down {
             self.restore_at = None;
         } else if released {
@@ -527,36 +619,195 @@ impl App {
         self.restore_at = None;
         match click_csp_title_bar() {
             Ok(()) => self.last_restore = Some(Instant::now()),
+            Err(platform::CSP_NOT_IN_FRONT) => {}
             Err(reason) => self.log(format!("没有恢复 CSP：{reason}")),
         }
     }
 
-    /// Lends the window the keyboard only while a text field has focus.
-    fn sync_keyboard(&mut self, ctx: &egui::Context) {
-        let wants_keyboard = ctx.egui_wants_keyboard_input();
-        if wants_keyboard != self.typing {
-            self.typing = wants_keyboard;
-            self.typing_active = false;
-            let granted = self.window.as_mut().is_none_or(|w| w.set_typing(wants_keyboard));
+    /// Lends a window the keyboard only while a text field has focus, or in the settings
+    /// window, while text is selected in the log to be copied. `settings` is the settings
+    /// window if that is the one being asked about, or else it is the main window.
+    fn sync_keyboard(&mut self, ctx: &egui::Context, settings: Option<isize>) {
+        let selecting = settings.is_some() && ctx.plugin::<LabelSelectionState>().lock().has_selection();
+        let wants_keyboard = ctx.egui_wants_keyboard_input() || selecting;
+        let (lent, other) = if settings.is_some() {
+            (&mut self.settings_keyboard, &mut self.keyboard)
+        } else {
+            (&mut self.keyboard, &mut self.settings_keyboard)
+        };
+        if other.typing && ctx.input(|i| i.pointer.any_pressed()) {
+            other.end_requested = true;
+            ctx.request_repaint();
+        }
+        let changed = wants_keyboard != lent.typing;
+        if changed {
+            lent.typing = wants_keyboard;
+            lent.active = false;
+            let left = std::mem::take(&mut lent.left);
+            self.restore_after_typing |= !wants_keyboard && !left;
+        }
+        let window_active = ctx.input(|i| i.focused);
+        if lent.typing && window_active {
+            lent.active = true;
+        }
+        let left = lent.typing && !window_active && lent.active;
+        lent.left |= left;
+        let end = left || std::mem::take(&mut lent.end_requested);
+        if changed {
+            let hwnd = settings.map(|hwnd| hwnd as _);
+            let granted = self.window.as_mut().is_none_or(|w| w.set_typing(hwnd, wants_keyboard));
             if !granted {
                 self.log("Windows 拒绝切换键盘焦点，请再点一次输入框");
             }
         }
-        if self.typing {
-            let window_active = ctx.input(|i| i.focused);
-            if window_active {
-                self.typing_active = true;
-            } else if self.typing_active {
-                // The user went back to CSP; end the edit so the next click on
-                // a slider does not activate the window again.
-                ctx.memory_mut(|memory| {
-                    if let Some(id) = memory.focused() {
-                        memory.surrender_focus(id);
-                    }
-                });
-                ctx.request_repaint();
+        if end {
+            // The user went elsewhere; end the edit so the next click on
+            // a slider does not activate the window again.
+            ctx.memory_mut(|memory| {
+                if let Some(id) = memory.focused() {
+                    memory.surrender_focus(id);
+                }
+            });
+            if selecting {
+                ctx.plugin::<LabelSelectionState>().lock().clear_selection();
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn hide_to_tray(&mut self) {
+        if let Some(window) = &self.window {
+            window.hide();
+        }
+    }
+
+    /// The close button, or anything else that asks the window to close.
+    fn close_requested(&mut self, ctx: &egui::Context) {
+        match self.settings.close_action {
+            None => self.close_dialog_open = true,
+            Some(CloseAction::MinimizeToTray) if self.tray.is_some() => self.hide_to_tray(),
+            Some(_) => self.quit(ctx),
+        }
+    }
+
+    fn quit(&mut self, ctx: &egui::Context) {
+        self.quitting = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn poll_tray(&mut self, ctx: &egui::Context) {
+        match tray::take_request() {
+            Some(tray::Request::Show) => {
+                if let Some(window) = &self.window {
+                    window.show();
+                }
+            }
+            Some(tray::Request::Settings) => self.settings_open = true,
+            Some(tray::Request::Quit) => self.quit(ctx),
+            None => {}
+        }
+    }
+
+    /// Asked once, the first time the window is closed.
+    fn close_dialog_ui(&mut self, ctx: &egui::Context, ui: &egui::Ui) {
+        let modal = egui::Modal::new(ui.scope_id().with("close")).show(ctx, |ui| {
+            ui.set_max_width(CLOSE_DIALOG_WIDTH);
+            ui.label(RichText::new("关闭 Percepta").strong());
+            ui.label("要最小化到托盘，还是直接退出？以后可以在设置里改。");
+            ui.label(RichText::new("托盘图标在任务栏右下角，可能收在小箭头里。").small());
+            ui.add_space(4.0);
+            let mut chosen = None;
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("最小化到托盘").clicked() {
+                    chosen = Some(CloseAction::MinimizeToTray);
+                }
+                if ui.button("直接退出").clicked() {
+                    chosen = Some(CloseAction::Quit);
+                }
+                if ui.button("取消").clicked() {
+                    self.close_dialog_open = false;
+                }
+            });
+            chosen
+        });
+        if modal.should_close() {
+            self.close_dialog_open = false;
+        }
+        if let Some(action) = modal.inner {
+            self.close_dialog_open = false;
+            self.settings.close_action = Some(action);
+            self.close_requested(ctx);
+        }
+    }
+
+    /// The panels fill the window, with a line between them that resizes the one above it.
+    fn panels_ui(&mut self, ui: &mut egui::Ui) {
+        let area = ui.max_rect();
+        if !self.dragging_splitter {
+            self.panel_heights = fit_panels(self.panel_heights, area.height());
+        }
+        let mut changed = false;
+        let mut top = area.top();
+        let mut grow = 0.0;
+        for panel in 0..PANEL_COUNT {
+            let height = self.panel_heights[panel];
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(area.left(), top),
+                egui::pos2(area.right(), top + height),
+            );
+            let content = rect.shrink2(egui::vec2(CONTENT_MARGIN, PANEL_PADDING));
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(content));
+            child.set_clip_rect(rect.intersect(ui.clip_rect()));
+            match panel {
+                0 => self.color_header_ui(&mut child),
+                1 => changed |= self.picker.wheel_panel(&mut child, &mut self.color),
+                _ => changed |= self.picker.slider_panel(&mut child, &mut self.color),
+            }
+            top += height;
+            if panel + 1 < PANEL_COUNT {
+                grow += self.splitter_ui(ui, panel, top);
+                top = area.top() + self.panel_heights[..=panel].iter().sum::<f32>();
             }
         }
+        if changed {
+            self.color_edited();
+        }
+        if grow > 0.0 {
+            let total: f32 = self.panel_heights.iter().sum();
+            let size = egui::vec2(area.width(), TITLE_BAR_HEIGHT + total);
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
+    }
+
+    /// Returns by how much the window should grow.
+    fn splitter_ui(&mut self, ui: &mut egui::Ui, panel: usize, y: f32) -> f32 {
+        let area = ui.max_rect();
+        let grab = egui::Rect::from_min_max(
+            egui::pos2(area.left(), y - SPLITTER_GRAB),
+            egui::pos2(area.right(), y + SPLITTER_GRAB),
+        );
+        let response = ui
+            .interact(grab, ui.scope_id().with(("splitter", panel)), egui::Sense::drag())
+            .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+        let color = if response.hovered() || response.dragged() {
+            SPLITTER_ACTIVE
+        } else {
+            ui.visuals().widgets.noninteractive.bg_stroke.color
+        };
+        let line_x = egui::Rangef::new(area.left() + CONTENT_MARGIN, area.right() - CONTENT_MARGIN);
+        ui.painter().hline(line_x, y, egui::Stroke::new(1.0, color));
+        if response.drag_started() {
+            self.dragging_splitter = true;
+        }
+        if response.drag_stopped() {
+            self.dragging_splitter = false;
+        }
+        if !response.dragged() {
+            return 0.0;
+        }
+        let (heights, grow) = drag_panel(self.panel_heights, panel, response.drag_delta().y);
+        self.panel_heights = heights;
+        grow
     }
 
     fn reset_link(&mut self) {
@@ -663,16 +914,18 @@ impl App {
     fn color_header_ui(&mut self, ui: &mut egui::Ui) {
         let rgb = self.color.rgb8();
         // While the field is being typed in, the user's text must stay as it is.
-        if !self.typing {
+        if !self.keyboard.typing {
             self.hex = to_hex(rgb);
         }
         let mut chosen = None;
+        let chip_height = (ui.available_height() - HEX_ROW_ROOM).max(MIN_SLOT_CHIP_HEIGHT);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = SLOT_CHIP_GAP;
             let unit = (ui.available_width() - SLOT_CHIP_GAP * 2.0) / SLOT_WIDTHS.iter().sum::<f32>();
             let slots = [(Slot::Main, "前景色"), (Slot::Sub, "背景色"), (Slot::Transparent, "透明色")];
             for ((slot, name), width) in slots.into_iter().zip(SLOT_WIDTHS) {
-                if slot_chip(ui, unit * width, self.slots.color(slot), self.slots.active == slot, name) {
+                let size = egui::vec2(unit * width, chip_height);
+                if slot_chip(ui, size, self.slots.color(slot), self.slots.active == slot, name) {
                     chosen = Some(slot);
                 }
             }
@@ -697,7 +950,11 @@ impl App {
                 let update_waiting = matches!(self.updater.state, update::State::Available(_));
                 let hover_text = if update_waiting { "设置（有新版本）" } else { "设置" };
                 if self.settings_icon.show(ui, self.settings_open, hover_text) {
-                    self.settings_open = true;
+                    if self.settings_open {
+                        self.close_settings();
+                    } else {
+                        self.settings_open = true;
+                    }
                 }
                 if update_waiting {
                     ui.painter().circle_filled(ui.min_rect().right_top(), UPDATE_DOT_RADIUS, CONNECTED);
@@ -721,12 +978,19 @@ impl App {
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("设置");
-        ui.add_space(4.0);
         ui.label(RichText::new("连接 CSP").strong());
         self.connection_ui(ui);
         switch(ui, &mut self.settings.restore_csp, "抬笔后自动点击 CSP 标题栏")
             .on_hover_text("修复用笔操作取色器后，数位板按键映射错误和笔刷光标卡住的问题");
+        ui.separator();
+
+        ui.label(RichText::new("关闭按钮").strong());
+        let mut action = self.settings.close_action;
+        ui.horizontal_wrapped(|ui| {
+            ui.radio_value(&mut action, Some(CloseAction::MinimizeToTray), "最小化到托盘");
+            ui.radio_value(&mut action, Some(CloseAction::Quit), "直接退出");
+        });
+        self.settings.close_action = action;
         ui.separator();
 
         ui.label(RichText::new("CMYK").strong());
@@ -753,10 +1017,87 @@ impl App {
                 }
             });
         });
-        ui.add_space(4.0);
-        if ui.button("关闭").clicked() {
-            self.settings_open = false;
+    }
+
+    /// Places the settings window when it first appears, and from then on remembers where
+    /// the user moves it to. Moving the main window alone changes nothing.
+    fn sync_settings_placement(&mut self, ctx: &egui::Context) {
+        let Some(window) = &self.window else { return };
+        let Some(hwnd) = self.settings_hwnd else {
+            if let Some(hwnd) = platform::find_own_window(SETTINGS_TITLE) {
+                platform::adopt_settings(hwnd);
+                // Only ever active because the user went to it, so its shadow has no conditions.
+                frame::install(hwnd, true, || true);
+                window.place_settings(hwnd, self.settings_offset, self.settings_size);
+                self.settings_hwnd = Some(hwnd as isize);
+                self.settings_position = window.settings_placement(hwnd).map(|(position, ..)| position);
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }
+            return;
+        };
+        self.remember_settings_placement(hwnd);
+    }
+
+    fn remember_settings_placement(&mut self, hwnd: isize) {
+        let Some(window) = &self.window else { return };
+        let Some((position, offset, size)) = window.settings_placement(hwnd as _) else { return };
+        if self.settings_position != Some(position) {
+            self.settings_position = Some(position);
+            self.settings_offset = Some(offset);
         }
+        self.settings_size = Some(size);
+    }
+
+    /// Every way of closing the window comes through here. The next one to open is a new
+    /// window, which must be found and given its frame all over again.
+    fn close_settings(&mut self) {
+        if let Some(hwnd) = self.settings_hwnd.take() {
+            self.remember_settings_placement(hwnd);
+            if std::mem::take(&mut self.settings_keyboard).typing {
+                if let Some(window) = &mut self.window {
+                    window.set_typing(Some(hwnd as _), false);
+                }
+                self.restore_after_typing = true;
+            }
+            platform::forget_settings();
+        }
+        self.settings_position = None;
+        self.settings_open = false;
+    }
+
+    /// A window of its own, so that the tray can open it while the main window is hidden.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let builder = egui::ViewportBuilder::default()
+            .with_title(SETTINGS_TITLE)
+            .with_inner_size(SETTINGS_SIZE)
+            .with_min_inner_size(SETTINGS_MIN_SIZE)
+            .with_decorations(false)
+            .with_maximize_button(false)
+            .with_taskbar(false)
+            .with_always_on_top()
+            // Hidden until it has been placed, or it would flash wherever Windows first puts it.
+            .with_visible(self.settings_hwnd.is_some());
+        let id = egui::ViewportId::from_hash_of("settings");
+        ctx.show_viewport_immediate(id, builder, |ui, _class| {
+            self.sync_settings_placement(ui.ctx());
+            if let Some(hwnd) = self.settings_hwnd {
+                self.sync_keyboard(ui.ctx(), Some(hwnd));
+            }
+            self.sync_csp_restore(ui.ctx());
+            let frame = egui::Frame::central_panel(ui.style()).inner_margin(0.0);
+            egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+                let closed = title_bar(ui, "设置", &mut self.settings_close_icon);
+                let content = ui.available_rect_before_wrap().shrink(CONTENT_MARGIN);
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(content));
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(&mut child, |ui| {
+                    self.settings_ui(ui);
+                });
+                window_edge(ui);
+                if closed || ui.input(|input| input.viewport().close_requested()) {
+                    self.close_settings();
+                }
+            });
+        });
     }
 
     fn update_ui(&mut self, ui: &mut egui::Ui) {
@@ -764,6 +1105,8 @@ impl App {
         ui.label(format!("当前版本：{}", update::CURRENT_VERSION));
         let mut install = None;
         let mut check = false;
+        let mut ask_update = false;
+        let mut cancel_update = false;
         match &self.updater.state {
             update::State::Idle => check = ui.button("检查更新").clicked(),
             update::State::Checking => {
@@ -781,8 +1124,18 @@ impl App {
                     ui.label(RichText::new(format!("有新版本 {}", release.version)).color(CONNECTED));
                     ui.hyperlink_to("更新内容", &release.page);
                 });
-                if ui.button("下载并安装").on_hover_text("Percepta 会关闭，装好后自动重新打开").clicked() {
-                    install = Some(release.clone());
+                if self.confirm_update {
+                    ui.label("更新需要退出 Percepta，装好后会自动重新打开。");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("退出并更新").clicked() {
+                            install = Some(release.clone());
+                        }
+                        if ui.button("取消").clicked() {
+                            cancel_update = true;
+                        }
+                    });
+                } else if ui.button("下载并安装").clicked() {
+                    ask_update = true;
                 }
             }
             update::State::Downloading(fraction) => {
@@ -799,6 +1152,7 @@ impl App {
         if check {
             self.updater.check(&ctx);
         }
+        self.confirm_update = (self.confirm_update || ask_update) && !cancel_update && install.is_none();
         if let Some(release) = install {
             self.updater.install(&ctx, release);
         }
@@ -838,44 +1192,107 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll_events();
         self.poll_scan(&ctx);
-        self.sync_keyboard(&ctx);
+        self.sync_keyboard(&ctx, None);
         self.sync_csp_restore(&ctx);
         self.sync_saved_state(&ctx);
         self.updater.poll();
-        if matches!(self.updater.state, update::State::Installing) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        self.poll_tray(&ctx);
+        if matches!(self.updater.state, update::State::Installing) && !self.quitting {
+            self.quit(&ctx);
+        }
+        if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_requested(&ctx);
         }
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                self.color_header_ui(ui);
-                ui.separator();
-                let mut changed = self.picker.wheel_panel(ui, &mut self.color);
-                ui.separator();
-                changed |= self.picker.slider_panel(ui, &mut self.color);
-                if changed {
-                    self.color_edited();
-                }
-            });
+        let frame = egui::Frame::central_panel(ui.style()).inner_margin(0.0);
+        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            if title_bar(ui, "Percepta", &mut self.close_icon) {
+                self.close_requested(&ctx);
+            }
+            let area = ui.available_rect_before_wrap();
+            let mut panels = ui.new_child(egui::UiBuilder::new().max_rect(area));
+            self.panels_ui(&mut panels);
+            window_edge(ui);
         });
 
-        if self.settings_open {
-            let modal = egui::Modal::new(ui.scope_id().with("settings")).show(&ctx, |ui| {
-                let room = ui.ctx().content_rect().size() - egui::Vec2::splat(SETTINGS_WINDOW_MARGIN);
-                ui.set_width(SETTINGS_WIDTH.min(room.x));
-                egui::ScrollArea::vertical().max_height(room.y).show(ui, |ui| self.settings_ui(ui));
-            });
-            if modal.should_close() {
-                self.settings_open = false;
-            }
+        if self.close_dialog_open {
+            self.close_dialog_ui(&ctx, ui);
         }
+        if self.settings_open {
+            self.settings_window(&ctx);
+        }
+    }
+}
+
+/// Paints the title bar and reports a click on its close button. Windows does the
+/// dragging, in `frame`, which leaves that button's corner to the UI.
+fn title_bar(ui: &mut egui::Ui, title: &str, close_icon: &mut IconButton) -> bool {
+    let (bar, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), TITLE_BAR_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter_at(bar);
+    painter.rect_filled(bar, 0.0, TITLE_BAR_FILL);
+    painter.text(
+        bar.center(),
+        egui::Align2::CENTER_CENTER,
+        title,
+        egui::FontId::proportional(TITLE_FONT_SIZE),
+        TITLE_TEXT,
+    );
+    let close = egui::Rect::from_min_max(egui::pos2(bar.right() - TITLE_BUTTON_WIDTH, bar.top()), bar.max);
+    close_icon.show_in(ui, close, ui.scope_id().with("title close"))
+}
+
+/// The thin line around the whole window, over everything else in it.
+fn window_edge(ui: &egui::Ui) {
+    let layer = egui::LayerId::new(egui::Order::Foreground, ui.scope_id().with("window edge"));
+    ui.ctx().layer_painter(layer).rect_stroke(
+        ui.ctx().content_rect(),
+        CORNER_RADIUS,
+        egui::Stroke::new(WINDOW_EDGE_WIDTH, WINDOW_EDGE),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// Makes the panels fill `total`. Spare room goes to the last one, and a shortage comes
+/// from the last one first, as far as the minimum heights allow.
+fn fit_panels(mut heights: [f32; PANEL_COUNT], total: f32) -> [f32; PANEL_COUNT] {
+    for (height, min) in heights.iter_mut().zip(MIN_PANEL_HEIGHTS) {
+        *height = height.max(min);
+    }
+    let mut spare = total - heights.iter().sum::<f32>();
+    if spare >= 0.0 {
+        heights[PANEL_COUNT - 1] += spare;
+        return heights;
+    }
+    for (height, min) in heights.iter_mut().zip(MIN_PANEL_HEIGHTS).rev() {
+        let taken = (*height - min).min(-spare);
+        *height -= taken;
+        spare += taken;
+    }
+    heights
+}
+
+/// Applies dragging the line below `panel` by `delta`. Returns the new heights, and by how
+/// much the window should grow. A panel that grows makes the window taller, while one that
+/// shrinks hands its room to the last panel and leaves the window as it is.
+fn drag_panel(mut heights: [f32; PANEL_COUNT], panel: usize, delta: f32) -> ([f32; PANEL_COUNT], f32) {
+    let new_height = (heights[panel] + delta).max(MIN_PANEL_HEIGHTS[panel]);
+    let change = new_height - heights[panel];
+    heights[panel] = new_height;
+    if change < 0.0 {
+        heights[PANEL_COUNT - 1] -= change;
+        (heights, 0.0)
+    } else {
+        (heights, change)
     }
 }
 
 /// A colour slot's button: its colour, or a checkerboard for transparent, outlined in
 /// the accent colour while active. Returns whether it was clicked.
-fn slot_chip(ui: &mut egui::Ui, width: f32, rgb: Option<Rgb>, active: bool, name: &str) -> bool {
-    let size = egui::vec2(width, SLOT_CHIP_HEIGHT);
+fn slot_chip(ui: &mut egui::Ui, size: egui::Vec2, rgb: Option<Rgb>, active: bool, name: &str) -> bool {
     let (outer, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let rect = outer.shrink(SLOT_OUTLINE_ROOM);
     let painter = ui.painter_at(outer);
@@ -964,6 +1381,31 @@ mod tests {
         assert_eq!(slots.active, Slot::Sub);
         assert_eq!(slots.sub, [9, 9, 9]);
         assert_eq!(slots.main, [1, 1, 1]);
+    }
+
+    #[test]
+    fn panels_fill_the_window_and_only_give_way_down_to_their_minimums() {
+        assert_eq!(fit_panels([72.0, 340.0, 208.0], 720.0), [72.0, 340.0, 308.0]);
+        assert_eq!(fit_panels([72.0, 340.0, 208.0], 570.0), [72.0, 340.0, 158.0]);
+        // The last panel gives way first, then the one above it.
+        assert_eq!(fit_panels([72.0, 340.0, 208.0], 500.0), [72.0, 278.0, 150.0]);
+        assert_eq!(fit_panels([72.0, 340.0, 208.0], 410.0), [60.0, 200.0, 150.0]);
+        // A saved height below the minimum is raised.
+        assert_eq!(fit_panels([10.0, 200.0, 150.0], 410.0), [60.0, 200.0, 150.0]);
+    }
+
+    #[test]
+    fn growing_a_panel_grows_the_window_but_shrinking_one_does_not() {
+        let heights = [72.0, 340.0, 208.0];
+        assert_eq!(drag_panel(heights, 1, 30.0), ([72.0, 370.0, 208.0], 30.0));
+        assert_eq!(drag_panel(heights, 1, -30.0), ([72.0, 310.0, 238.0], 0.0));
+        // Stops at the minimum, and the rest of the drag does nothing.
+        assert_eq!(drag_panel(heights, 0, -30.0), ([60.0, 340.0, 220.0], 0.0));
+    }
+
+    #[test]
+    fn the_smallest_window_fits_the_minimum_panels_under_the_title_bar() {
+        assert_eq!(MIN_WINDOW_HEIGHT, 430.0);
     }
 
     #[test]

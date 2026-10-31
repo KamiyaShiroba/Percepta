@@ -50,6 +50,44 @@ Source: "..\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
 Name: "{group}\Percepta"; Filename: "{app}\percepta.exe"
 Name: "{autodesktop}\Percepta"; Filename: "{app}\percepta.exe"; Tasks: desktopicon
 
+[Code]
+const
+  // PerceptaTray and WM_APP + 2, as in src/tray.rs. An older version has no such window,
+  // and closes through CloseApplications instead.
+  QuitMessage = $8002;
+  QuitWaitSteps = 50;
+  QuitWaitStepMs = 100;
+
+procedure QuitRunningPercepta;
+var
+  Window: HWND;
+  Step, ResultCode: Integer;
+begin
+  Window := FindWindowByClassName('PerceptaTray');
+  if Window = 0 then
+    Exit;
+  PostMessage(Window, QuitMessage, 0, 0);
+  for Step := 1 to QuitWaitSteps do
+  begin
+    Sleep(QuitWaitStepMs);
+    if FindWindowByClassName('PerceptaTray') = 0 then
+      Exit;
+  end;
+  Exec('taskkill.exe', '/F /IM percepta.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  QuitRunningPercepta;
+  Result := '';
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  QuitRunningPercepta;
+  Result := True;
+end;
+
 [Run]
 Filename: "{app}\percepta.exe"; Description: "{cm:LaunchProgram,Percepta}"; Flags: nowait postinstall skipifsilent
 ; An update runs silently, and started from the app, which has closed for it.

@@ -3,50 +3,58 @@
 use std::ffi::c_void;
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONULL};
+use windows_sys::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
+};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, VK_LBUTTON,
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateIcon, DispatchMessageW, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
-    GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-    MsgWaitForMultipleObjects, PeekMessageW, SendMessageTimeoutW, SendMessageW, SetForegroundWindow,
+    CreateIcon, DispatchMessageW, FindWindowW, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow,
+    GetSystemMetrics, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic,
+    IsWindowVisible, MsgWaitForMultipleObjects, PeekMessageW, SendMessageTimeoutW, SetForegroundWindow,
     SetWindowLongPtrW, SetWindowPos, WindowFromPoint, EVENT_SYSTEM_FOREGROUND, GA_ROOTOWNER, GWL_EXSTYLE,
-    GW_HWNDPREV, HICON, HTCAPTION, HWND_NOTOPMOST, HWND_TOPMOST, ICON_BIG, ICON_SMALL, MA_NOACTIVATE, MSG,
-    PM_REMOVE, QS_ALLINPUT, SMTO_ABORTIFHUNG, SM_CXICON, SM_CXSMICON, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, STYLESTRUCT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, WINDOWPOS, WINEVENT_OUTOFCONTEXT, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
-    WM_MOUSEACTIVATE, WM_NCHITTEST, WM_SETICON, WM_STYLECHANGING, WM_WINDOWPOSCHANGING, WS_EX_NOACTIVATE,
+    GW_HWNDNEXT, GW_HWNDPREV, HICON, HTCAPTION, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, MA_NOACTIVATE, MSG,
+    PM_REMOVE, QS_ALLINPUT, SMTO_ABORTIFHUNG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, STYLESTRUCT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    WINDOWPOS, WINEVENT_OUTOFCONTEXT, WM_MOUSEACTIVATE,
+    WM_NCHITTEST, WM_STYLECHANGING, WM_WINDOWPOSCHANGING, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST,
 };
+
+use crate::frame;
 
 /// Set while a text field holds the keyboard. There is only one palette window.
 static TYPING: AtomicBool = AtomicBool::new(false);
 /// Set while the window should act like any other, because the user is not in CSP.
 static ORDINARY_WINDOW: AtomicBool = AtomicBool::new(false);
-/// Whether the user is dragging or resizing the window right now.
-static IN_SIZE_MOVE: AtomicBool = AtomicBool::new(false);
-/// The scale winit knows about, which lags the real one during a drag.
-static APPLIED_DPI: AtomicU32 = AtomicU32::new(0);
 /// Set by the foreground event, to wake the thread that keeps the window's level.
 static FOREGROUND_CHANGED: AtomicBool = AtomicBool::new(false);
 /// Alternates the title bar click position so two quick clicks never count as a
 /// double-click, which would maximise CSP.
 static USE_SECOND_SPOT: AtomicBool = AtomicBool::new(false);
+/// Set while the window is hidden in the tray.
+static CLOAKED: AtomicBool = AtomicBool::new(false);
 
+/// The settings window while it is open, for the thread that follows CSP.
+static SETTINGS_WINDOW: AtomicIsize = AtomicIsize::new(0);
+/// The same as `TYPING`, for the settings window.
+static SETTINGS_TYPING: AtomicBool = AtomicBool::new(false);
+
+/// Why there was nothing to restore, as is normal while the user is in another program.
+pub const CSP_NOT_IN_FRONT: &str = "CSP 不在前台";
 const HIT_TEST_TIMEOUT_MS: u32 = 50;
 /// A point this far in from the window's corner lies on its title bar.
 const TITLE_BAR_PROBE: i32 = 20;
@@ -59,6 +67,8 @@ const ORDINARY_SETTLE_TIME: Duration = Duration::from_secs(1);
 const TITLE_SPOT_STEP: i32 = 24;
 const TITLE_ROW_STEP: i32 = 6;
 const TITLE_ROW_LIMIT: i32 = 60;
+/// Between the main window and the settings window when it opens beside it.
+const WINDOW_GAP: i32 = 8;
 
 /// winit rewrites the extended style whenever its own window flags change, and
 /// shows the window with a plain `SW_SHOW` after the first time. Both would undo
@@ -71,77 +81,76 @@ unsafe extern "system" fn palette_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
-    // A window dragged across monitors of different scales gets resized at the moment
-    // most of it crosses. The new size can put most of it back on the old monitor, which
-    // changes the scale again, so it flickers and can even refuse to cross. Holding the
-    // scale still until the drag ends avoids all of that.
-    match message {
-        WM_ENTERSIZEMOVE => IN_SIZE_MOVE.store(true, Ordering::Relaxed),
-        WM_DPICHANGED if IN_SIZE_MOVE.load(Ordering::Relaxed) => return 0,
-        WM_DPICHANGED => APPLIED_DPI.store(wparam as u32 & 0xFFFF, Ordering::Relaxed),
-        WM_EXITSIZEMOVE => {
-            IN_SIZE_MOVE.store(false, Ordering::Relaxed);
-            // SAFETY: forwards the arguments Windows gave us. winit must see the end of
-            // the drag first, or it would treat the change as still being dragged.
-            let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
-            apply_held_dpi(hwnd);
-            return result;
-        }
-        _ => {}
-    }
     // winit rewrites the whole extended style without knowing about the topmost state,
     // which `follow_csp` sets behind its back.
     if message == WM_STYLECHANGING && wparam as i32 == GWL_EXSTYLE {
         // SAFETY: for this message Windows passes a valid STYLESTRUCT.
         let style = unsafe { &mut *(lparam as *mut STYLESTRUCT) };
         style.styleNew = (style.styleNew & !WS_EX_TOPMOST) | (style.styleOld & WS_EX_TOPMOST);
+        // Keeps it off the taskbar and out of Alt+Tab, as the tray icon stands in for both.
+        style.styleNew = (style.styleNew & !WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW;
     }
-    if !TYPING.load(Ordering::Relaxed) && !ORDINARY_WINDOW.load(Ordering::Relaxed) {
-        match message {
-            WM_MOUSEACTIVATE => return MA_NOACTIVATE as LRESULT,
-            WM_STYLECHANGING if wparam as i32 == GWL_EXSTYLE => {
-                // SAFETY: for this message Windows passes a valid STYLESTRUCT.
-                unsafe { (*(lparam as *mut STYLESTRUCT)).styleNew |= WS_EX_NOACTIVATE };
-            }
-            WM_WINDOWPOSCHANGING => {
-                // SAFETY: for this message Windows passes a valid WINDOWPOS.
-                unsafe { (*(lparam as *mut WINDOWPOS)).flags |= SWP_NOACTIVATE };
-            }
-            _ => {}
-        }
+    if message == WM_MOUSEACTIVATE && keeps_inactive(&TYPING) {
+        return MA_NOACTIVATE as LRESULT;
+    }
+    if keeps_inactive(&TYPING) {
+        guard_activation(message, wparam, lparam);
     }
     // SAFETY: forwards the arguments Windows gave us.
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
-/// Delivers the scale change that was held back during a drag, if the window ended up
-/// on a monitor with a different scale.
-fn apply_held_dpi(hwnd: HWND) {
-    // SAFETY: only reads the window's state; `rect` is valid for writes.
-    let (dpi, rect) = unsafe {
-        let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-        GetWindowRect(hwnd, &mut rect);
-        (GetDpiForWindow(hwnd), rect)
-    };
-    let applied = APPLIED_DPI.swap(dpi, Ordering::Relaxed);
-    if dpi == 0 || applied == 0 || dpi == applied {
-        return;
+/// The settings window stays out of the way of CSP just as the palette does.
+unsafe extern "system" fn settings_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    if message == WM_MOUSEACTIVATE && keeps_inactive(&SETTINGS_TYPING) {
+        return MA_NOACTIVATE as LRESULT;
     }
-    let suggested = scaled_rect(rect, applied, dpi);
-    let dpi_pair = (dpi << 16 | dpi) as WPARAM;
-    // SAFETY: the message's documented arguments; `suggested` outlives the call.
-    unsafe { DefSubclassProc(hwnd, WM_DPICHANGED, dpi_pair, &suggested as *const RECT as LPARAM) };
+    if keeps_inactive(&SETTINGS_TYPING) {
+        guard_activation(message, wparam, lparam);
+    }
+    // SAFETY: forwards the arguments Windows gave us.
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
-/// The same top-left corner, with the size converted between two scales.
-fn scaled_rect(rect: RECT, from_dpi: u32, to_dpi: u32) -> RECT {
-    let scale = |length: i32| (length as i64 * to_dpi as i64 / from_dpi as i64) as i32;
-    RECT {
-        left: rect.left,
-        top: rect.top,
-        right: rect.left + scale(rect.right - rect.left),
-        bottom: rect.top + scale(rect.bottom - rect.top),
+fn keeps_inactive(typing: &AtomicBool) -> bool {
+    !typing.load(Ordering::Relaxed) && !ORDINARY_WINDOW.load(Ordering::Relaxed)
+}
+
+fn guard_activation(message: u32, wparam: WPARAM, lparam: LPARAM) {
+    match message {
+        WM_STYLECHANGING if wparam as i32 == GWL_EXSTYLE => {
+            // SAFETY: for this message Windows passes a valid STYLESTRUCT.
+            unsafe { (*(lparam as *mut STYLESTRUCT)).styleNew |= WS_EX_NOACTIVATE };
+        }
+        WM_WINDOWPOSCHANGING => {
+            // SAFETY: for this message Windows passes a valid WINDOWPOS.
+            unsafe { (*(lparam as *mut WINDOWPOS)).flags |= SWP_NOACTIVATE };
+        }
+        _ => {}
     }
+}
+
+/// Starts keeping a newly opened settings window from taking the foreground from CSP.
+pub fn adopt_settings(settings: HWND) {
+    SETTINGS_WINDOW.store(settings as isize, Ordering::Relaxed);
+    // SAFETY: called on the thread that owns the window, and the procedure needs no
+    // reference data.
+    unsafe { SetWindowSubclass(settings, Some(settings_proc), 1, 0) };
+    if !ORDINARY_WINDOW.load(Ordering::Relaxed) {
+        update_ex_style(settings, |style| style | WS_EX_NOACTIVATE);
+    }
+}
+
+/// The settings window has closed.
+pub fn forget_settings() {
+    SETTINGS_WINDOW.store(0, Ordering::Relaxed);
 }
 
 /// A window that takes mouse input without becoming the active window, so CSP
@@ -161,24 +170,62 @@ impl PaletteWindow {
         // SAFETY: called on the thread that owns the window, and the procedure
         // needs no reference data.
         unsafe {
-            APPLIED_DPI.store(GetDpiForWindow(palette.hwnd as HWND), Ordering::Relaxed);
             SetWindowSubclass(palette.hwnd as HWND, Some(palette_proc), 1, 0);
         }
         update_ex_style(palette.hwnd as HWND, |style| style | WS_EX_NOACTIVATE);
+        frame::install(palette.hwnd as HWND, true, palette_shadow_allowed);
         Some(palette)
     }
 
-    /// Text fields need the keyboard, so while the user is in CSP the window is activated
-    /// only while one has focus, and returns the keyboard to CSP afterwards. Returns false
-    /// if Windows refused to activate it.
-    pub fn set_typing(&mut self, typing: bool) -> bool {
-        let hwnd = self.hwnd as *mut c_void;
-        TYPING.store(typing, Ordering::Relaxed);
+    /// Takes the window off the screen, and the keyboard back from it if it had it.
+    pub fn hide(&self) {
+        let hwnd = self.hwnd as HWND;
+        CLOAKED.store(true, Ordering::Relaxed);
+        frame::set_cloaked(hwnd, true);
+        frame::refresh_shadow(hwnd);
+        // SAFETY: plain window queries, and stale handles only fail.
+        unsafe {
+            if GetForegroundWindow() == hwnd {
+                let next = next_app_window(hwnd);
+                if !next.is_null() {
+                    SetForegroundWindow(next);
+                }
+            }
+        }
+    }
+
+    /// Puts the window back in front of the normal windows.
+    pub fn show(&self) {
+        let hwnd = self.hwnd as HWND;
+        CLOAKED.store(false, Ordering::Relaxed);
+        frame::set_cloaked(hwnd, false);
+        // SAFETY: takes no pointers, and a stale handle only fails. While following CSP
+        // the window can't be activated, and being topmost is all it needs.
+        unsafe {
+            SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if ORDINARY_WINDOW.load(Ordering::Relaxed) {
+                SetForegroundWindow(hwnd);
+            }
+        }
+    }
+
+    /// Text fields need the keyboard, so while the user is in CSP a window is activated
+    /// only while one has focus, and returns the keyboard to CSP afterwards. `settings` is
+    /// the settings window if that is the one, or else it is this one. Returns false if
+    /// Windows refused to activate it.
+    pub fn set_typing(&mut self, settings: Option<HWND>, typing: bool) -> bool {
+        let hwnd = settings.unwrap_or(self.hwnd as HWND);
+        let flag = if settings.is_some() { &SETTINGS_TYPING } else { &TYPING };
+        flag.store(typing, Ordering::Relaxed);
         if typing {
             update_ex_style(hwnd, |style| style & !WS_EX_NOACTIVATE);
             // SAFETY: plain Win32 calls; a stale HWND only makes them fail.
             unsafe {
-                self.previous = GetForegroundWindow() as isize;
+                let front = GetForegroundWindow() as isize;
+                // Going straight from a field in one window to a field in the other.
+                if front != self.hwnd && front != SETTINGS_WINDOW.load(Ordering::Relaxed) {
+                    self.previous = front;
+                }
                 SetForegroundWindow(hwnd) != 0
             }
         } else {
@@ -191,6 +238,7 @@ impl PaletteWindow {
                     }
                 }
             }
+            frame::refresh_shadow(hwnd);
             true
         }
     }
@@ -202,6 +250,47 @@ impl PaletteWindow {
         // SAFETY: `rect` is valid for writes, and a stale handle only fails.
         let ok = unsafe { IsIconic(self.hwnd as HWND) == 0 && GetWindowRect(self.hwnd as HWND, &mut rect) != 0 };
         ok.then_some(([rect.left, rect.top], [rect.right - rect.left, rect.bottom - rect.top]))
+    }
+
+    /// Gives the settings window its last size, and puts it where it was relative to this
+    /// one, or beside this one if it has no such place or that would be off every monitor.
+    pub fn place_settings(&self, settings: HWND, offset: Option<[i32; 2]>, size: Option<[i32; 2]>) {
+        let mut main = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let mut own = main;
+        // SAFETY: an all-zero MONITORINFO is valid, every pointer is to a local that outlives
+        // its call, and stale handles only make the calls fail.
+        unsafe {
+            if let Some([width, height]) = size.filter(|&[width, height]| width > 0 && height > 0) {
+                SetWindowPos(settings, ptr::null_mut(), 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            GetWindowRect(self.hwnd as HWND, &mut main);
+            GetWindowRect(settings, &mut own);
+            let mut monitor: MONITORINFO = std::mem::zeroed();
+            monitor.cbSize = size_of::<MONITORINFO>() as u32;
+            let nearest = MonitorFromWindow(self.hwnd as HWND, MONITOR_DEFAULTTONEAREST);
+            GetMonitorInfoW(nearest, &mut monitor);
+            let remembered = offset.map(|[x, y]| [main.left + x, main.top + y]).filter(|[x, y]| {
+                let title_bar = POINT { x: x + TITLE_BAR_PROBE, y: y + TITLE_BAR_PROBE };
+                !MonitorFromPoint(title_bar, MONITOR_DEFAULTTONULL).is_null()
+            });
+            let size = [own.right - own.left, own.bottom - own.top];
+            let [x, y] = remembered.unwrap_or_else(|| beside(main, size, monitor.rcWork));
+            SetWindowPos(settings, ptr::null_mut(), x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+
+    /// The settings window's top-left corner, where that is relative to this window, and
+    /// its size. `None` if either window has gone.
+    pub fn settings_placement(&self, settings: HWND) -> Option<([i32; 2], [i32; 2], [i32; 2])> {
+        let mut main = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let mut own = main;
+        // SAFETY: both pointers are to locals, and stale handles only make the calls fail.
+        let ok = unsafe { GetWindowRect(self.hwnd as HWND, &mut main) != 0 && GetWindowRect(settings, &mut own) != 0 };
+        ok.then_some((
+            [own.left, own.top],
+            [own.left - main.left, own.top - main.top],
+            [own.right - own.left, own.bottom - own.top],
+        ))
     }
 
     /// Puts the window back where it was, unless that would leave its title bar off every
@@ -219,22 +308,6 @@ impl PaletteWindow {
             // and the saved size is already in that monitor's pixels.
             if let Some([width, height]) = size {
                 SetWindowPos(hwnd, ptr::null_mut(), 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-            }
-        }
-    }
-
-    /// Sets the title bar and taskbar icons. eframe can only do this for an active
-    /// window, which this one avoids being, so they would stay blank until focused.
-    /// `pixels` gives the top-down RGBA image for a square size.
-    pub fn set_icon(&self, pixels: impl Fn(usize) -> Vec<u8>) {
-        // SAFETY: takes no pointers.
-        let sizes = unsafe { [(ICON_BIG, GetSystemMetrics(SM_CXICON)), (ICON_SMALL, GetSystemMetrics(SM_CXSMICON))] };
-        for (kind, size) in sizes {
-            let icon = create_icon(&pixels(size as usize), size);
-            if !icon.is_null() {
-                // SAFETY: both handles are valid. The icon stays in use for as long
-                // as the window, so it is never destroyed.
-                unsafe { SendMessageW(self.hwnd as HWND, WM_SETICON, kind as WPARAM, icon as LPARAM) };
             }
         }
     }
@@ -277,7 +350,7 @@ impl PaletteWindow {
                 });
                 // SAFETY: only reads the window's state; a stale handle reads as false.
                 let (shown, minimized) = unsafe { (IsWindowVisible(hwnd) != 0, IsIconic(hwnd) != 0) };
-                if !shown || minimized {
+                if !shown || minimized || is_cloaked() {
                     visible = false;
                     continue;
                 }
@@ -359,14 +432,71 @@ fn next_mode(mode: WindowMode, front: Front, settled_away: bool) -> WindowMode {
 fn apply_mode(hwnd: HWND, mode: WindowMode) {
     let ordinary = mode == WindowMode::Ordinary;
     ORDINARY_WINDOW.store(ordinary, Ordering::Relaxed);
-    if ordinary {
-        update_ex_style(hwnd, |style| style & !WS_EX_NOACTIVATE);
-    } else if !TYPING.load(Ordering::Relaxed) {
-        update_ex_style(hwnd, |style| style | WS_EX_NOACTIVATE);
+    let settings = SETTINGS_WINDOW.load(Ordering::Relaxed) as HWND;
+    for (window, typing) in [(hwnd, &TYPING), (settings, &SETTINGS_TYPING)] {
+        if window.is_null() {
+            continue;
+        }
+        if ordinary {
+            update_ex_style(window, |style| style & !WS_EX_NOACTIVATE);
+        } else if !typing.load(Ordering::Relaxed) {
+            update_ex_style(window, |style| style | WS_EX_NOACTIVATE);
+        }
+        frame::refresh_shadow(window);
     }
 }
 
-fn create_icon(rgba: &[u8], size: i32) -> HICON {
+/// To the right of `main` if there is room on its monitor, or else to its left, and kept
+/// on the monitor either way.
+fn beside(main: RECT, [width, height]: [i32; 2], work: RECT) -> [i32; 2] {
+    let right = main.right + WINDOW_GAP;
+    let left = main.left - WINDOW_GAP - width;
+    let x = if right + width <= work.right || left < work.left { right } else { left };
+    let x = x.min(work.right - width).max(work.left);
+    let y = main.top.min(work.bottom - height).max(work.top);
+    [x, y]
+}
+
+/// The shadow marks the window as really being in use: while typing, or while the user
+/// has come to it from somewhere other than CSP.
+fn palette_shadow_allowed() -> bool {
+    TYPING.load(Ordering::Relaxed) || ORDINARY_WINDOW.load(Ordering::Relaxed)
+}
+
+/// Whether the palette window is hidden in the tray.
+pub fn is_cloaked() -> bool {
+    CLOAKED.load(Ordering::Relaxed)
+}
+
+/// The first window below `hwnd` that a user would count as an open window.
+fn next_app_window(hwnd: HWND) -> HWND {
+    // SAFETY: plain window queries; a window that has vanished ends the walk.
+    unsafe {
+        let mut next = GetWindow(hwnd, GW_HWNDNEXT);
+        while !next.is_null() {
+            let tool = GetWindowLongPtrW(next, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW != 0;
+            if IsWindowVisible(next) != 0 && IsIconic(next) == 0 && !tool {
+                return next;
+            }
+            next = GetWindow(next, GW_HWNDNEXT);
+        }
+    }
+    ptr::null_mut()
+}
+
+/// Finds a window of this process by its title, for the ones eframe opens on its own.
+pub fn find_own_window(title: &str) -> Option<HWND> {
+    let title: Vec<u16> = title.encode_utf16().chain([0]).collect();
+    // SAFETY: `title` is NUL-terminated and outlives the call, and `pid` is valid for writes.
+    unsafe {
+        let hwnd = FindWindowW(ptr::null(), title.as_ptr());
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        (!hwnd.is_null() && pid == GetCurrentProcessId()).then_some(hwnd)
+    }
+}
+
+pub fn create_icon(rgba: &[u8], size: i32) -> HICON {
     // Icons take blue first. The alpha channel decides the shape, so the separate
     // 1-bit mask, padded to whole 16-bit words per row, stays empty.
     let bgra: Vec<u8> = rgba
@@ -551,7 +681,7 @@ pub fn click_csp_title_bar() -> Result<(), &'static str> {
         let root = GetAncestor(GetForegroundWindow(), GA_ROOTOWNER);
         GetWindowThreadProcessId(root, &mut pid);
         if pid == 0 || pid == GetCurrentProcessId() || !process_image(pid).is_some_and(|p| is_csp_image(&p)) {
-            return Err("CSP 不在前台");
+            return Err(CSP_NOT_IN_FRONT);
         }
         root
     };
@@ -708,11 +838,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scaled_rect_keeps_the_corner_and_converts_the_size() {
-        let rect = RECT { left: 2000, top: 100, right: 2570, bottom: 1000 };
-        let scaled = scaled_rect(rect, 144, 168);
-        assert_eq!((scaled.left, scaled.top), (2000, 100));
-        assert_eq!((scaled.right - scaled.left, scaled.bottom - scaled.top), (665, 1050));
+    fn settings_open_beside_the_main_window_and_stay_on_its_monitor() {
+        let rect = |left, top, right, bottom| RECT { left, top, right, bottom };
+        let work = rect(0, 0, 1920, 1040);
+        // Room on the right.
+        assert_eq!(beside(rect(100, 50, 670, 900), [480, 780], work), [678, 50]);
+        // Only room on the left.
+        assert_eq!(beside(rect(1300, 50, 1870, 900), [480, 780], work), [812, 50]);
+        // Room on neither side, and too low to fit: it stays on the monitor.
+        assert_eq!(beside(rect(200, 500, 1700, 1000), [480, 780], work), [1440, 260]);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "percepta"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Colour picker for Clip Studio Paint, connected over Companion Mode"
 license = "MIT"
@@ -19,8 +19,10 @@ serde_json = "1"
 sha2 = "0.11"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Networking_WinHttp",
+    "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_UI_Accessibility",
     "Win32_UI_HiDpi",

@@ -5,7 +5,7 @@ The Companion Mode wire format used by Percepta was documented by:
 - ok-picker-csp, MIT License, Copyright (c) 2026 luapwastaken
   https://github.com/luapwastaken/ok-picker-csp
 
-assets/settings.svg is from Tabler Icons, MIT License,
+assets/settings.svg and assets/close.svg are from Tabler Icons, MIT License,
 Copyright (c) 2020-2024 Paweł Kuna
 https://github.com/tabler/tabler-icons
 

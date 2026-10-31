@@ -16,7 +16,7 @@ Percepta，取自 **Perception（感知）** 和 **Chroma（彩度）**。不被
 
 ## 怎么用？
 
-先去 [Releases](https://github.com/KamiyaShiroba/Percepta/releases/latest) 下载 `Percepta-Setup-版本号.exe` 装上。不需要管理员权限，以后有新版本时，设置里点一下就能更新。
+先去 [Releases](https://github.com/KamiyaShiroba/Percepta/releases/latest) 下载对应版本的exe文件装上就好。
 
 安装包还没有代码签名，所以 Windows 可能会弹出“已保护你的电脑”。点 **更多信息**，再点 **仍要运行** 就好。
 
@@ -64,8 +64,8 @@ cargo build --release
 
 ## 还在路上
 
-- v1.1.0：色环和滑块像 CSP 那样自由停靠：上下组合、合并成标签页，或者拉出去单独成窗口。组合的时候，各部分的高度也可以自己调。
-- v1.1.0：跟随 CSP 启动、最小化和关闭，自绘标题栏，以及界面国际化。
+- v1.0.1：各个面板的高度可以自己调；任务栏图标换成托盘图标；设置变成独立窗口；自绘标题栏和阴影。
+- v1.1.0：颜色槽、色环和滑块像 CSP 那样自由停靠：上下左右贴边组合、合并成标签页，或者拉出去单独成窗口，还会记住上次的布局；另外还有跟随 CSP 启动、最小化和关闭，以及界面国际化。
 - 文档色彩配置文件的适配。
 - 优动漫版的适配。
 
@@ -75,7 +75,7 @@ cargo build --release
 
 - [clipremote](https://github.com/chocolatkey/clipremote) 和 [ok-picker-csp](https://github.com/luapwastaken/ok-picker-csp)：没有前人摸清协议，这个项目连第一步都迈不出去。
 - [Björn Ottosson](https://bottosson.github.io/posts/oklab/)：发明了 Oklab，是这一切的起点。
-- [Tabler Icons](https://github.com/tabler/tabler-icons)：设置按钮的小齿轮。
+- [Tabler Icons](https://github.com/tabler/tabler-icons)：设置按钮的小齿轮和关闭按钮的叉。
 
 详细的来源和许可证信息见 [NOTICE](NOTICE)。
 

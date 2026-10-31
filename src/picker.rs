@@ -15,7 +15,9 @@ use crate::color::{
 use crate::csp::Rgb;
 use crate::icc::{Cmyk, CmykConverter};
 
-const MAX_WHEEL_SIZE: f32 = 270.0;
+/// Below the wheel, the row with the values and the sRGB switch.
+const READOUT_ROOM: f32 = 26.0;
+const MIN_WHEEL_SIZE: f32 = 100.0;
 /// Room around the ring for the hue cursor, which sticks out past its edges.
 const RING_MARGIN: f32 = 3.0;
 const RING_BORDER: Color32 = Color32::from_gray(165);
@@ -79,6 +81,7 @@ const BADGE_FONT_SIZE: f32 = 10.5;
 const BADGE_VALUE_GAP: f32 = 4.0;
 const BADGE_GROUP_GAP: f32 = 6.0;
 const ICON_BUTTON_SIZE: f32 = 22.0;
+const ICON_SCALE: f32 = 0.8;
 const ICON_IDLE: Color32 = Color32::from_gray(130);
 /// CMYK has this many sliders, and every tab takes the height they need.
 const MAX_SLIDER_ROWS: usize = 4;
@@ -422,7 +425,21 @@ impl IconButton {
     pub fn show(&mut self, ui: &mut egui::Ui, active: bool, hover_text: &str) -> bool {
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(ICON_BUTTON_SIZE), Sense::click());
         let response = response.on_hover_text(hover_text);
-        let pixels = (ICON_BUTTON_SIZE * ui.pixels_per_point()).ceil() as u32;
+        self.paint(ui, &response, rect.center(), active);
+        response.clicked()
+    }
+
+    /// The same button over an area the caller has laid out.
+    pub fn show_in(&mut self, ui: &mut egui::Ui, area: Rect, id: egui::Id) -> bool {
+        let response = ui.interact(area, id, Sense::click());
+        self.paint(ui, &response, area.center(), false);
+        response.clicked()
+    }
+
+    fn paint(&mut self, ui: &egui::Ui, response: &Response, center: Pos2, active: bool) {
+        // Drawn smaller than the area that takes clicks, which stays easy to hit with a pen.
+        let rect = Rect::from_center_size(center, Vec2::splat(ICON_BUTTON_SIZE * ICON_SCALE));
+        let pixels = (rect.width() * ui.pixels_per_point()).ceil() as u32;
         if self.texture.as_ref().is_none_or(|(size, _)| *size != pixels) {
             self.texture = render_svg(self.svg, pixels).map(|image| {
                 (pixels, ui.ctx().load_texture("icon", image, TextureOptions::LINEAR))
@@ -440,7 +457,6 @@ impl IconButton {
             let whole = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
             ui.painter().image(texture.id(), rect, whole, tint);
         }
-        response.clicked()
     }
 }
 
@@ -527,7 +543,7 @@ impl Picker {
             }
         });
         ui.add_space(TAB_BOTTOM_GAP);
-        let size = ui.available_width().min(MAX_WHEEL_SIZE);
+        let size = ui.available_width().min(ui.available_height() - READOUT_ROOM).max(MIN_WHEEL_SIZE);
         let mut changed = ui.vertical_centered(|ui| self.wheel(ui, color, size)).inner;
         ui.horizontal(|ui| {
             // Either panel in OKLCH can run into the limit, and this is the one place

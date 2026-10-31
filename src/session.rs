@@ -22,6 +22,15 @@ pub struct SavedLayout {
     pub size: Option<[i32; 2]>,
     pub wheel: Model,
     pub slider: SliderTab,
+    /// The heights of the colour slots, the wheel and the sliders, at 100% scale.
+    #[serde(default)]
+    pub panels: Option<[i32; 3]>,
+    /// Where the settings window was relative to this one, in physical pixels.
+    #[serde(default)]
+    pub settings_offset: Option<[i32; 2]>,
+    /// The settings window's outer size, in physical pixels.
+    #[serde(default)]
+    pub settings_size: Option<[i32; 2]>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -37,11 +46,19 @@ pub struct SavedColors {
 pub struct SavedSettings {
     pub restore_csp: bool,
     pub check_updates: bool,
+    /// `None` until the user has been asked, the first time they close the window.
+    pub close_action: Option<CloseAction>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum CloseAction {
+    MinimizeToTray,
+    Quit,
 }
 
 impl Default for SavedSettings {
     fn default() -> Self {
-        Self { restore_csp: true, check_updates: true }
+        Self { restore_csp: true, check_updates: true, close_action: None }
     }
 }
 
