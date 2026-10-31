@@ -8,14 +8,15 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::text_selection::LabelSelectionState;
 use eframe::egui::{self, Color32, RichText};
+use windows_sys::Win32::Foundation::RECT;
 
 use crate::color::ColorState;
 use crate::csp::auth::{parse_qr_url, Pairing};
 use crate::csp::client::CspSlots;
 use crate::csp::worker::{Command, Event, Worker};
 use crate::csp::{Rgb, Slot};
-use crate::frame::{self, CORNER_RADIUS, TITLE_BAR_HEIGHT, TITLE_BUTTON_WIDTH};
-use crate::layout::{self, Axis, Node, Panel, DEFAULT_HEIGHTS, MIN_HEIGHTS};
+use crate::frame::{self, CORNER_RADIUS, DRAG_THRESHOLD, TITLE_BAR_HEIGHT, TITLE_BUTTON_WIDTH};
+use crate::layout::{self, Axis, Drop as DockDrop, Node, Panel, DEFAULT_HEIGHTS, MIN_HEIGHTS, MODULE_TITLE_HEIGHT};
 use crate::picker::{app_icon_pixels, switch, IconButton, Picker};
 use crate::platform::{self, click_csp_title_bar, pen_or_mouse_down, PaletteWindow};
 use crate::session::{CloseAction, SavedColors, SavedLayout, SavedSettings};
@@ -63,6 +64,19 @@ const HIDDEN_REPAINT_INTERVAL: Duration = Duration::from_secs(1);
 const TITLE_BAR_FILL: Color32 = Color32::from_gray(232);
 const TITLE_TEXT: Color32 = Color32::from_gray(90);
 const TITLE_FONT_SIZE: f32 = 12.0;
+const MODULE_TITLE_FILL: Color32 = Color32::from_gray(240);
+const ACTIVE_TAB_FILL: Color32 = Color32::from_gray(250);
+const MODULE_TITLE_PADDING: f32 = 8.0;
+/// The part of a module's title strip, from its top, for landing above the module.
+const DROP_ABOVE_ZONE: f32 = 6.0;
+/// How far below its title strip still means landing among its tabs.
+const DROP_TAB_ZONE: f32 = 20.0;
+/// The part of a module, from its bottom, for landing below it.
+const DROP_BELOW_ZONE: f32 = 24.0;
+/// In physical pixels, at any scale: the edge of a mark where a window would land, and the
+/// whole thickness of the line it goes in along, beside a module or between tabs.
+const DROP_EDGE: i32 = 6;
+const DROP_LINE: i32 = 24;
 const WINDOW_EDGE: Color32 = Color32::from_gray(150);
 const WINDOW_EDGE_WIDTH: f32 = 1.0;
 const CONTENT_MARGIN: f32 = 8.0;
@@ -205,6 +219,44 @@ struct LentKeyboard {
     end_requested: bool,
 }
 
+/// A window of its own, holding a panel or a stack of tabs.
+struct FloatingWindow {
+    id: u64,
+    node: Node,
+    /// Once it has been found and given its frame.
+    hwnd: Option<isize>,
+    /// Where to put it when it first appears, in physical pixels.
+    position: [i32; 2],
+    /// When it first appears.
+    size: egui::Vec2,
+    close_icon: IconButton,
+}
+
+impl FloatingWindow {
+    fn title(&self) -> String {
+        format!("Percepta 窗口 {}", self.id)
+    }
+}
+
+/// A panel or a stack of tabs on its way somewhere, while the layout stays as it is.
+struct PanelDrag {
+    /// The window it comes from, or `None` for the main window.
+    source: Option<u64>,
+    panels: Vec<Panel>,
+    /// The area it fills now, at 100% scale.
+    size: egui::Vec2,
+    /// How far into that area the pointer holds it, in physical pixels.
+    grab: [i32; 2],
+}
+
+/// Where a stack of tabs in the main window is, at 100% scale from the window's corner.
+struct DockTarget {
+    panels: Vec<Panel>,
+    rect: egui::Rect,
+    /// Where each tab begins, and where the last one ends.
+    tab_edges: Vec<f32>,
+}
+
 pub struct App {
     window: Option<PaletteWindow>,
     /// By window.
@@ -251,6 +303,19 @@ pub struct App {
     confirm_update: bool,
     dock: Node,
     dragging_splitter: bool,
+    floating: Vec<FloatingWindow>,
+    next_window_id: u64,
+    dragging: Option<PanelDrag>,
+    ghost: frame::DragGhost,
+    /// The window that the ghost is standing in for, until it appears.
+    ghost_until: Option<u64>,
+    /// Floating windows to take back into the main window.
+    docking_back: Vec<u64>,
+    dock_targets: Vec<DockTarget>,
+    main_scale: f32,
+    /// The height that the main window's minimum was last set for.
+    main_min_height: f32,
+    drop_indicator: frame::DropIndicator,
 
     blocked: bool,
     csp_in_front: bool,
@@ -346,6 +411,16 @@ impl App {
             confirm_update: false,
             dock,
             dragging_splitter: false,
+            floating: Vec::new(),
+            next_window_id: 1,
+            dragging: None,
+            ghost: frame::DragGhost::new(),
+            ghost_until: None,
+            docking_back: Vec::new(),
+            dock_targets: Vec::new(),
+            main_scale: 1.0,
+            main_min_height: 0.0,
+            drop_indicator: frame::DropIndicator::new(),
             blocked: false,
             csp_in_front: true,
             generation: String::new(),
@@ -392,11 +467,23 @@ impl App {
             size,
             wheel,
             slider,
-            dock: Some(self.dock.rounded()),
+            dock: Some(self.dock_with_floating().rounded()),
             panels: None,
             settings_offset: self.settings_offset,
             settings_size: self.settings_size,
         }
+    }
+
+    /// Floating windows don't outlive the app yet, so what is saved has their panels back
+    /// in the main window.
+    fn dock_with_floating(&self) -> Node {
+        let mut dock = self.dock.clone();
+        for panels in self.floating.iter().map(|window| window.node.panels()) {
+            if let Some(&last) = dock.panels().last() {
+                dock.dock(last, DockDrop::Side { axis: Axis::Vertical, before: false }, panels);
+            }
+        }
+        dock
     }
 
     fn save_colors(&mut self) {
@@ -676,6 +763,13 @@ impl App {
         if let Some(window) = &self.window {
             window.hide();
         }
+        self.cloak_floating(true);
+    }
+
+    fn cloak_floating(&self, cloaked: bool) {
+        for hwnd in self.floating.iter().filter_map(|window| window.hwnd) {
+            frame::set_cloaked(hwnd as _, cloaked);
+        }
     }
 
     /// The close button, or anything else that asks the window to close.
@@ -698,6 +792,7 @@ impl App {
                 if let Some(window) = &self.window {
                     window.show();
                 }
+                self.cloak_floating(false);
             }
             Some(tray::Request::Settings) => self.settings_open = true,
             Some(tray::Request::Quit) => self.quit(ctx),
@@ -740,13 +835,26 @@ impl App {
     /// The panels fill the window, with lines between them that resize the one before them.
     fn panels_ui(&mut self, ui: &mut egui::Ui) {
         let area = ui.max_rect();
+        self.main_scale = ui.ctx().pixels_per_point();
+        self.dock_targets.clear();
         let mut dock = std::mem::take(&mut self.dock);
+        let min_height = dock.min_size(Axis::Vertical);
+        if min_height != self.main_min_height {
+            self.main_min_height = min_height;
+            let size = egui::vec2(dock.min_size(Axis::Horizontal), TITLE_BAR_HEIGHT + min_height);
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
+        }
+        // Windows only applies a minimum the next time the window is resized.
+        if area.height() + 0.5 < min_height {
+            let size = egui::vec2(area.width(), TITLE_BAR_HEIGHT + min_height);
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
         if !self.dragging_splitter {
             dock.fit(area.width(), area.height());
         }
         let mut changed = false;
         let mut grow = egui::Vec2::ZERO;
-        self.node_ui(ui, &mut dock, area, ui.scope_id().with("dock"), &mut changed, &mut grow);
+        self.node_ui(ui, &mut dock, area, ui.scope_id().with("dock"), &mut changed, &mut grow, None);
         if changed {
             self.color_edited();
         }
@@ -767,13 +875,12 @@ impl App {
         id: egui::Id,
         changed: &mut bool,
         grow: &mut egui::Vec2,
+        source: Option<u64>,
     ) {
         let (axis, children) = match node {
             Node::Split { axis, children } => (*axis, children),
             Node::Tabs { panels, active } => {
-                if let Some(&panel) = panels.get(*active).or(panels.first()) {
-                    *changed |= self.panel_ui(ui, panel, rect);
-                }
+                self.stack_ui(ui, panels, active, rect, id, changed, source);
                 return;
             }
         };
@@ -782,7 +889,7 @@ impl App {
             let before: f32 = children[..index].iter().map(|child| child.size).sum();
             let child_rect = span(rect, axis, start + before, start + before + children[index].size);
             let grown_before = *grow;
-            self.node_ui(ui, &mut children[index].node, child_rect, id.with(index), changed, grow);
+            self.node_ui(ui, &mut children[index].node, child_rect, id.with(index), changed, grow, source);
             // A nested split that had the window grow has made this child bigger too.
             children[index].size += along((*grow - grown_before).to_pos2(), axis);
             if index + 1 < children.len() {
@@ -795,6 +902,301 @@ impl App {
                 }
             }
         }
+    }
+
+    /// A panel or a stack of tabs under its title strip, in the main window.
+    fn stack_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        panels: &[Panel],
+        active: &mut usize,
+        rect: egui::Rect,
+        id: egui::Id,
+        changed: &mut bool,
+        source: Option<u64>,
+    ) {
+        let strip = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), MODULE_TITLE_HEIGHT));
+        let content = egui::Rect::from_min_max(egui::pos2(rect.left(), strip.bottom()), rect.max);
+        let background = ui.interact(strip, id.with("strip"), egui::Sense::drag());
+        ui.painter().rect_filled(strip, 0.0, MODULE_TITLE_FILL);
+        let (tear, tab_edges) = tabs_ui(ui, panels, active, strip, id);
+        let tear = tear.or_else(|| dragged_far_enough(ui, &background).then(|| panels.to_vec()));
+        if let Some(panels) = tear {
+            self.start_panel_drag(ui, source, self.main_hwnd(), panels, rect);
+        }
+        if source.is_none() {
+            self.dock_targets.push(DockTarget { panels: panels.to_vec(), rect, tab_edges });
+        }
+        if let Some(&panel) = panels.get(*active).or(panels.first()) {
+            *changed |= self.panel_ui(ui, panel, content);
+        }
+    }
+
+    fn start_panel_drag(&mut self, ui: &egui::Ui, source: Option<u64>, hwnd: isize, panels: Vec<Panel>, rect: egui::Rect) {
+        if self.dragging.is_some() {
+            return;
+        }
+        let Some(pointer) = ui.ctx().input(|input| input.pointer.press_origin()) else { return };
+        let scale = ui.ctx().pixels_per_point();
+        let grab = (pointer - rect.min) * scale;
+        let [x, y] = frame::window_origin(hwnd as _);
+        self.ghost.show(RECT {
+            left: x + (rect.left() * scale) as i32,
+            top: y + (rect.top() * scale) as i32,
+            right: x + (rect.right() * scale) as i32,
+            bottom: y + (rect.bottom() * scale) as i32,
+        });
+        self.dragging = Some(PanelDrag { source, panels, size: rect.size(), grab: [grab.x as i32, grab.y as i32] });
+        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+    }
+
+    /// Keeps the ghost under the cursor, and when the pen lifts, does what was asked.
+    fn sync_panel_drag(&mut self, ctx: &egui::Context) {
+        if let Some(id) = self.ghost_until {
+            let window = self.floating.iter().find(|window| window.id == id);
+            if window.is_none_or(|window| window.hwnd.is_some()) {
+                self.ghost.hide();
+                self.ghost_until = None;
+            } else {
+                ctx.request_repaint();
+            }
+        }
+        let Some(drag) = &self.dragging else { return };
+        let [x, y] = platform::cursor_position();
+        let position = [x - drag.grab[0], y - drag.grab[1]];
+        if pen_or_mouse_down() {
+            self.ghost.move_to(position);
+            ctx.request_repaint();
+            return;
+        }
+        let Some(drag) = self.dragging.take() else { return };
+        let spot = self.drop_at_cursor(&drag);
+        let over_main = self.cursor_over_main();
+        let node = match drag.source {
+            None => Some(&mut self.dock),
+            Some(id) => self.floating.iter_mut().find(|window| window.id == id).map(|window| &mut window.node),
+        };
+        // A window has to keep something.
+        let Some(node) = node.filter(|node| node.panels().len() > drag.panels.len()) else {
+            self.ghost.hide();
+            return;
+        };
+        if spot.is_none() && over_main {
+            self.ghost.hide();
+            return;
+        }
+        for &panel in &drag.panels {
+            node.remove(panel);
+        }
+        if let Some((target, drop, _)) = spot {
+            self.dock.dock(target, drop, drag.panels);
+            self.ghost.hide();
+            return;
+        }
+        let id = self.next_window_id;
+        self.next_window_id += 1;
+        self.floating.push(FloatingWindow {
+            id,
+            node: Node::tabs(drag.panels),
+            hwnd: None,
+            position,
+            size: drag.size,
+            close_icon: IconButton::new(CLOSE_ICON),
+        });
+        self.ghost_until = Some(id);
+        ctx.request_repaint();
+    }
+
+    fn cursor_over_main(&self) -> bool {
+        let Some((position, size)) = self.window.as_ref().and_then(PaletteWindow::placement) else { return false };
+        let [x, y] = platform::cursor_position();
+        (position[0]..position[0] + size[0]).contains(&x) && (position[1]..position[1] + size[1]).contains(&y)
+    }
+
+    /// Where `drag`, dropped at the cursor, would land in the main window, and the area to
+    /// mark for that, at 100% scale from the window's corner: all of a module to join its
+    /// tabs, or with no width or height, the line where it would go in between tabs or beside
+    /// a module. The target is a panel that stays where it is after the drag, so a stack can't
+    /// land on itself.
+    fn drop_at_cursor(&self, drag: &PanelDrag) -> Option<(Panel, DockDrop, egui::Rect)> {
+        if platform::is_cloaked() || !self.cursor_over_main() {
+            return None;
+        }
+        let (position, _) = self.window.as_ref()?.placement()?;
+        let [x, y] = platform::cursor_position();
+        let point = egui::pos2((x - position[0]) as f32, (y - position[1]) as f32) / self.main_scale;
+        // The title bar above the first module counts as the top of that module.
+        let target = self.dock_targets.iter().find(|target| target.rect.contains(point)).or_else(|| {
+            self.dock_targets.first().filter(|first| point.y < first.rect.top())
+        })?;
+        let moving = |panel: &&Panel| drag.source.is_none() && drag.panels.contains(panel);
+        let &panel = target.panels.iter().find(|panel| !moving(panel))?;
+        let rect = target.rect;
+        let strip_bottom = rect.top() + MODULE_TITLE_HEIGHT;
+        let side = |before: bool, line: f32| {
+            let mark = egui::Rect::from_x_y_ranges(rect.x_range(), line..=line);
+            (panel, DockDrop::Side { axis: Axis::Vertical, before }, mark)
+        };
+        if point.y < rect.top() + DROP_ABOVE_ZONE {
+            return Some(side(true, rect.top()));
+        }
+        if point.y < strip_bottom + DROP_TAB_ZONE {
+            let tab_centers = target.tab_edges.windows(2).map(|tab| (tab[0] + tab[1]) / 2.0);
+            let index = tab_centers.filter(|center| point.x > *center).count();
+            let line = target.tab_edges.get(index).copied().unwrap_or(rect.left());
+            let mark = egui::Rect::from_x_y_ranges(line..=line, rect.top()..=strip_bottom);
+            // Where that is once what is moving has left, if it comes from these same tabs.
+            let leaving = target.panels[..index.min(target.panels.len())].iter().filter(|panel| moving(panel)).count();
+            return Some((panel, DockDrop::Tab(index - leaving), mark));
+        }
+        if point.y > rect.bottom() - DROP_BELOW_ZONE {
+            return Some(side(false, rect.bottom()));
+        }
+        Some((panel, DockDrop::Tab(usize::MAX), rect))
+    }
+
+    /// Windows take their own title bar drags, and say when one has ended.
+    fn sync_moved_windows(&mut self) {
+        let hwnd = frame::take_move_end();
+        let Some(index) = self.floating.iter().position(|window| window.hwnd == Some(hwnd)) else { return };
+        let window = &self.floating[index];
+        let panels = window.node.panels();
+        let drag = PanelDrag { source: Some(window.id), panels, size: egui::Vec2::ZERO, grab: [0, 0] };
+        if let Some((target, drop, _)) = self.drop_at_cursor(&drag) {
+            self.floating.remove(index);
+            self.dock.dock(target, drop, drag.panels);
+        }
+    }
+
+    /// While something is being dragged, shows where it would land.
+    fn sync_drop_indicator(&mut self, ctx: &egui::Context) {
+        let moving = frame::moving_window();
+        let floating = self.floating.iter().find(|window| window.hwnd == Some(moving));
+        let moved = floating.map(|window| PanelDrag {
+            source: Some(window.id),
+            panels: window.node.panels(),
+            size: egui::Vec2::ZERO,
+            grab: [0, 0],
+        });
+        let Some(drag) = self.dragging.as_ref().or(moved.as_ref()) else {
+            self.drop_indicator.hide();
+            return;
+        };
+        ctx.request_repaint();
+        let spot = self.drop_at_cursor(drag);
+        let placement = self.window.as_ref().and_then(PaletteWindow::placement);
+        let (Some((_, _, rect)), Some((position, size))) = (spot, placement) else {
+            self.drop_indicator.hide();
+            return;
+        };
+        let scale = self.main_scale;
+        let pixels = |value: f32| (value * scale).round() as i32;
+        // A line along one axis is kept whole at the window's edge.
+        let line = |at: f32, length: i32| {
+            let start = (pixels(at) - DROP_LINE / 2).clamp(0, (length - DROP_LINE).max(0));
+            (start, start + DROP_LINE)
+        };
+        let span = |start: f32, end: f32, length: i32| (pixels(start).clamp(0, length), pixels(end).clamp(0, length));
+        let ((left, right), (top, bottom), edges) = if rect.width() == 0.0 {
+            (line(rect.left(), size[0]), span(rect.top(), rect.bottom(), size[1]), [DROP_EDGE, 0])
+        } else if rect.height() == 0.0 {
+            (span(rect.left(), rect.right(), size[0]), line(rect.top(), size[1]), [0, DROP_EDGE])
+        } else {
+            (span(rect.left(), rect.right(), size[0]), span(rect.top(), rect.bottom(), size[1]), [DROP_EDGE, DROP_EDGE])
+        };
+        self.drop_indicator.show(
+            RECT {
+                left: position[0] + left,
+                top: position[1] + top,
+                right: position[0] + right,
+                bottom: position[1] + bottom,
+            },
+            edges,
+        );
+    }
+
+    fn floating_windows(&mut self, ctx: &egui::Context) {
+        let mut windows = std::mem::take(&mut self.floating);
+        for window in &mut windows {
+            self.floating_window(ctx, window);
+        }
+        self.floating = windows;
+        for id in std::mem::take(&mut self.docking_back) {
+            if let Some(index) = self.floating.iter().position(|window| window.id == id) {
+                let window = self.floating.remove(index);
+                if let Some(&last) = self.dock.panels().last() {
+                    let drop = DockDrop::Side { axis: Axis::Vertical, before: false };
+                    self.dock.dock(last, drop, window.node.panels());
+                }
+            }
+        }
+    }
+
+    fn floating_window(&mut self, ctx: &egui::Context, window: &mut FloatingWindow) {
+        let title = window.title();
+        let min_size = [window.node.min_size(Axis::Horizontal), window.node.min_size(Axis::Vertical)];
+        let builder = egui::ViewportBuilder::default()
+            .with_title(title.clone())
+            .with_inner_size(window.size)
+            .with_min_inner_size(min_size)
+            .with_decorations(false)
+            .with_maximize_button(false)
+            .with_taskbar(false)
+            // Hidden until it has been placed, as with the settings window.
+            .with_visible(window.hwnd.is_some());
+        let id = egui::ViewportId::from_hash_of(("floating", window.id));
+        ctx.show_viewport_immediate(id, builder, |ui, _class| {
+            let ctx = ui.ctx().clone();
+            let Some(hwnd) = window.hwnd.or_else(|| {
+                let hwnd = platform::find_own_window(&title)?;
+                platform::guard_window(hwnd, true);
+                frame::install(hwnd, true, platform::palette_shadow_allowed);
+                platform::move_window(hwnd, window.position);
+                platform::raise_new_window(hwnd);
+                window.hwnd = Some(hwnd as isize);
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+                Some(hwnd as isize)
+            }) else {
+                return;
+            };
+            self.sync_keyboard(&ctx, hwnd, false);
+            self.sync_csp_restore(&ctx);
+            let frame = egui::Frame::central_panel(ui.style()).inner_margin(0.0);
+            egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+                let closed = self.floating_contents_ui(ui, window, hwnd);
+                window_edge(ui);
+                if closed || ui.input(|input| input.viewport().close_requested()) {
+                    self.docking_back.push(window.id);
+                }
+            });
+        });
+    }
+
+    /// The title strip here is also the window's title bar. Returns whether it was closed.
+    fn floating_contents_ui(&mut self, ui: &mut egui::Ui, window: &mut FloatingWindow, hwnd: isize) -> bool {
+        let rect = ui.max_rect();
+        let id = ui.scope_id().with("floating");
+        let strip = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), MODULE_TITLE_HEIGHT));
+        let content = egui::Rect::from_min_max(egui::pos2(rect.left(), strip.bottom()), rect.max);
+        ui.painter().rect_filled(strip, 0.0, TITLE_BAR_FILL);
+        let Node::Tabs { panels, active } = &mut window.node else { return false };
+        let (tear, tab_edges) = tabs_ui(ui, panels, active, strip, id);
+        // A lone panel has nothing but its name there, which drags the window like the rest.
+        let tabs_end = tab_edges.last().copied().unwrap_or(rect.left());
+        let caption_left = if panels.len() > 1 { tabs_end - rect.left() } else { 0.0 };
+        frame::set_caption_left(hwnd as _, caption_left);
+        if let Some(torn) = tear {
+            self.start_panel_drag(ui, Some(window.id), hwnd, torn, rect);
+        }
+        let close = egui::Rect::from_min_max(egui::pos2(strip.right() - TITLE_BUTTON_WIDTH, strip.top()), strip.max);
+        let closed = window.close_icon.show_in(ui, close, id.with("close"));
+        let panel = panels.get(*active).or(panels.first()).copied();
+        if let Some(panel) = panel {
+            if self.panel_ui(ui, panel, content) {
+                self.color_edited();
+            }
+        }
+        closed
     }
 
     /// Returns whether the colour was changed.
@@ -952,8 +1354,7 @@ impl App {
     fn color_header_ui(&mut self, ui: &mut egui::Ui) {
         let rgb = self.color.rgb8();
         // While the field is being typed in, the user's text must stay as it is.
-        let typing = self.keyboards.get(&self.main_hwnd()).is_some_and(|keyboard| keyboard.typing);
-        if !typing {
+        if !self.keyboards.values().any(|keyboard| keyboard.typing) {
             self.hex = to_hex(rgb);
         }
         let mut chosen = None;
@@ -997,9 +1398,6 @@ impl App {
                 }
                 if update_waiting {
                     ui.painter().circle_filled(ui.min_rect().right_top(), UPDATE_DOT_RADIUS, CONNECTED);
-                }
-                if self.color.gamut_mapped {
-                    ui.label(RichText::new("已映射").color(WARNING)).on_hover_text("超出 sRGB，已映射到色域内");
                 }
             });
         });
@@ -1231,6 +1629,8 @@ impl eframe::App for App {
         self.sync_keyboard(&ctx, self.main_hwnd(), false);
         self.sync_csp_restore(&ctx);
         self.sync_saved_state(&ctx);
+        self.sync_panel_drag(&ctx);
+        self.sync_moved_windows();
         self.updater.poll();
         self.poll_tray(&ctx);
         if matches!(self.updater.state, update::State::Installing) && !self.quitting {
@@ -1251,6 +1651,8 @@ impl eframe::App for App {
             self.panels_ui(&mut panels);
             window_edge(ui);
         });
+        self.sync_drop_indicator(&ctx);
+        self.floating_windows(&ctx);
 
         if self.close_dialog_open {
             self.close_dialog_ui(&ctx, ui);
@@ -1281,6 +1683,61 @@ fn title_bar(ui: &mut egui::Ui, title: &str, close_icon: &mut IconButton) -> boo
     close_icon.show_in(ui, close, ui.scope_id().with("title close"))
 }
 
+/// The name of a panel, or the tabs of several, along a title strip. Returns the panels that
+/// the user started dragging out, if any, and where each tab begins and the last one ends.
+fn tabs_ui(
+    ui: &mut egui::Ui,
+    panels: &[Panel],
+    active: &mut usize,
+    strip: egui::Rect,
+    id: egui::Id,
+) -> (Option<Vec<Panel>>, Vec<f32>) {
+    let font = egui::FontId::proportional(TITLE_FONT_SIZE);
+    let mut left = strip.left();
+    let mut edges = vec![left];
+    let mut torn = None;
+    for (index, &panel) in panels.iter().enumerate() {
+        let galley = ui.painter().layout_no_wrap(panel_name(panel).to_owned(), font.clone(), TITLE_TEXT);
+        let width = galley.size().x + MODULE_TITLE_PADDING * 2.0;
+        let tab = egui::Rect::from_min_size(egui::pos2(left, strip.top()), egui::vec2(width, strip.height()));
+        if panels.len() > 1 {
+            let response = ui.interact(tab, id.with(("tab", index)), egui::Sense::click_and_drag());
+            // As soon as it is pressed, so that it is what shows when it comes to be dragged.
+            if response.is_pointer_button_down_on() {
+                *active = index;
+            }
+            if dragged_far_enough(ui, &response) {
+                torn = Some(vec![panel]);
+            }
+            if index == *active {
+                ui.painter().rect_filled(tab, 0.0, ACTIVE_TAB_FILL);
+            }
+        }
+        let text = egui::pos2(tab.left() + MODULE_TITLE_PADDING, tab.center().y - galley.size().y / 2.0);
+        ui.painter().galley(text, galley, TITLE_TEXT);
+        left += width;
+        edges.push(left);
+    }
+    (torn, edges)
+}
+
+/// Whether what `response` is about is being dragged, by more than a shaky pen would.
+fn dragged_far_enough(ui: &egui::Ui, response: &egui::Response) -> bool {
+    response.dragged()
+        && ui.ctx().input(|input| {
+            let pointer = &input.pointer;
+            pointer.press_origin().zip(pointer.latest_pos()).is_some_and(|(from, to)| (to - from).length() >= DRAG_THRESHOLD)
+        })
+}
+
+fn panel_name(panel: Panel) -> &'static str {
+    match panel {
+        Panel::Slots => "颜色",
+        Panel::Wheel => "色环",
+        Panel::Sliders => "滑块",
+    }
+}
+
 /// The thin line around the whole window, over everything else in it.
 fn window_edge(ui: &egui::Ui) {
     let layer = egui::LayerId::new(egui::Order::Foreground, ui.scope_id().with("window edge"));
@@ -1294,7 +1751,8 @@ fn window_edge(ui: &egui::Ui) {
 
 /// What the saved layout says about the panels, or failing that, the default arrangement.
 fn saved_dock(layout: &SavedLayout) -> Node {
-    let upgraded = layout.panels.map(|heights| Node::stack(heights.map(|height| height as f32)));
+    // Those heights had no title strips.
+    let upgraded = layout.panels.map(|heights| Node::stack(heights.map(|height| height as f32 + MODULE_TITLE_HEIGHT)));
     layout.dock.clone().or(upgraded).filter(Node::is_complete).unwrap_or_default()
 }
 
@@ -1419,7 +1877,7 @@ mod tests {
             settings_offset: None,
             settings_size: None,
         };
-        assert_eq!(saved_dock(&layout), Node::stack([80.0, 300.0, 170.0]));
+        assert_eq!(saved_dock(&layout), Node::stack([100.0, 320.0, 190.0]));
 
         layout.dock = Some(Node::stack([90.0, 310.0, 180.0]));
         assert_eq!(saved_dock(&layout), Node::stack([90.0, 310.0, 180.0]));
@@ -1430,7 +1888,7 @@ mod tests {
 
     #[test]
     fn the_smallest_window_fits_the_minimum_panels_under_the_title_bar() {
-        assert_eq!(MIN_WINDOW_HEIGHT, 430.0);
+        assert_eq!(MIN_WINDOW_HEIGHT, 490.0);
     }
 
     #[test]

@@ -88,6 +88,12 @@ fn guarded_windows() -> Vec<Guarded> {
     GUARDED.lock().map_or_else(|_| Vec::new(), |windows| windows.clone())
 }
 
+/// The windows that hold panels, which all follow CSP together.
+fn panel_windows() -> Vec<HWND> {
+    let windows = guarded_windows().into_iter().filter(|window| window.state.tool_window);
+    windows.map(|window| window.hwnd as HWND).collect()
+}
+
 fn guarded_window(hwnd: isize) -> Option<Guarded> {
     guarded_windows().into_iter().find(|window| window.hwnd == hwnd)
 }
@@ -205,6 +211,7 @@ impl PaletteWindow {
         let palette = Self { hwnd: handle.hwnd.get() };
         guard_window(palette.hwnd as HWND, true);
         frame::install(palette.hwnd as HWND, true, palette_shadow_allowed);
+        frame::repaint_on_move(palette.hwnd as HWND);
         Some(palette)
     }
 
@@ -383,19 +390,27 @@ impl PaletteWindow {
                     TopmostAction::None => {}
                     TopmostAction::Raise => {
                         place_window(hwnd, HWND_TOPMOST);
+                        // Above this one, whose place in that band would otherwise cover them.
+                        for other in guarded_windows().iter().filter(|other| other.hwnd != hwnd as isize) {
+                            place_window(other.hwnd as HWND, HWND_TOPMOST);
+                        }
                         topmost = true;
                         last_assert = Instant::now();
                     }
                     TopmostAction::Lower => {
-                        place_window(hwnd, HWND_NOTOPMOST);
-                        // Leaving the topmost band puts it above all normal windows.
-                        tuck_under_foreground(hwnd);
+                        for window in panel_windows() {
+                            place_window(window, HWND_NOTOPMOST);
+                            // Leaving the topmost band puts it above all normal windows.
+                            tuck_under_foreground(window);
+                        }
                         topmost = false;
                         last_assert = Instant::now();
                     }
                     TopmostAction::Recheck => {
-                        if !is_below_foreground(hwnd) {
-                            tuck_under_foreground(hwnd);
+                        for window in panel_windows() {
+                            if !is_below_foreground(window) {
+                                tuck_under_foreground(window);
+                            }
                         }
                         last_assert = Instant::now();
                     }
@@ -457,7 +472,7 @@ fn beside(main: RECT, [width, height]: [i32; 2], work: RECT) -> [i32; 2] {
 
 /// The shadow marks the window as really being in use: while typing, or while the user
 /// has come to it from somewhere other than CSP.
-fn palette_shadow_allowed(hwnd: HWND) -> bool {
+pub fn palette_shadow_allowed(hwnd: HWND) -> bool {
     let typing = guarded_window(hwnd as isize).is_some_and(|window| window.state.typing.load(Ordering::Relaxed));
     typing || ORDINARY_WINDOW.load(Ordering::Relaxed)
 }
@@ -662,6 +677,26 @@ enum Front {
     Other,
     /// Passing between windows.
     Nothing,
+}
+
+/// Where the cursor is, in physical pixels.
+pub fn cursor_position() -> [i32; 2] {
+    let mut point = POINT { x: 0, y: 0 };
+    // SAFETY: `point` is valid for writes.
+    unsafe { GetCursorPos(&mut point) };
+    [point.x, point.y]
+}
+
+/// Puts a new window that holds panels on top, the way the others are at the moment.
+pub fn raise_new_window(hwnd: HWND) {
+    let ordinary = ORDINARY_WINDOW.load(Ordering::Relaxed);
+    place_window(hwnd, if ordinary { HWND_TOP } else { HWND_TOPMOST });
+}
+
+/// Moves a window without resizing, raising or activating it.
+pub fn move_window(hwnd: HWND, [x, y]: [i32; 2]) {
+    // SAFETY: takes no pointers, and a stale handle only fails.
+    unsafe { SetWindowPos(hwnd, ptr::null_mut(), x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) };
 }
 
 pub fn pen_or_mouse_down() -> bool {

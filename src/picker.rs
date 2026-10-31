@@ -80,6 +80,7 @@ const BADGE_FILL: Color32 = Color32::from_gray(50);
 const BADGE_FONT_SIZE: f32 = 10.5;
 const BADGE_VALUE_GAP: f32 = 4.0;
 const BADGE_GROUP_GAP: f32 = 6.0;
+const GAMUT_MAPPED_RING: Color32 = Color32::from_rgb(240, 150, 40);
 const ICON_BUTTON_SIZE: f32 = 22.0;
 const ICON_SCALE: f32 = 0.8;
 const ICON_IDLE: Color32 = Color32::from_gray(130);
@@ -774,6 +775,11 @@ impl Picker {
             square.top() + y.clamp(0.0, 1.0) as f32 * square.height(),
         );
         draw_cursor(&painter, point);
+        if color.gamut_mapped {
+            // The colour sent is not the one under the cursor, but its nearest within sRGB.
+            painter.circle_stroke(point, 9.0, Stroke::new(1.0, Color32::BLACK));
+            painter.circle_stroke(point, 7.5, Stroke::new(2.0, GAMUT_MAPPED_RING));
+        }
         changed
     }
 
