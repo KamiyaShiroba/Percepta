@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize};
 use crate::color::Model;
 use crate::csp::auth::Pairing;
 use crate::csp::{Rgb, Slot};
+use crate::layout::Node;
 use crate::picker::SliderTab;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct SavedLayout {
     /// The window's top-left corner, in physical pixels.
     pub position: Option<[i32; 2]>,
@@ -22,8 +23,12 @@ pub struct SavedLayout {
     pub size: Option<[i32; 2]>,
     pub wheel: Model,
     pub slider: SliderTab,
-    /// The heights of the colour slots, the wheel and the sliders, at 100% scale.
+    /// How the panels are arranged, with sizes at 100% scale.
     #[serde(default)]
+    pub dock: Option<Node>,
+    /// What 1.0.1 saved instead of `dock`: the heights of the colour slots, the wheel and the
+    /// sliders, at 100% scale.
+    #[serde(default, skip_serializing)]
     pub panels: Option<[i32; 3]>,
     /// Where the settings window was relative to this one, in physical pixels.
     #[serde(default)]
@@ -140,6 +145,19 @@ mod tests {
         let layout: SavedLayout = serde_json::from_str(old).unwrap();
         assert_eq!(layout.position, Some([76, 76]));
         assert_eq!(layout.size, None);
+    }
+
+    #[test]
+    fn a_layout_comes_back_with_its_arrangement_and_without_the_old_heights() {
+        let old = r#"{"position":[1,2],"wheel":"Hsv","slider":{"Color":"Hsv"},"panels":[80,300,170]}"#;
+        let mut layout: SavedLayout = serde_json::from_str(old).unwrap();
+        assert_eq!(layout.panels, Some([80, 300, 170]));
+        layout.dock = Some(Node::stack([80.0, 300.0, 170.0]));
+
+        let text = serde_json::to_string(&layout).unwrap();
+        assert!(!text.contains("[80,300,170]"), "{text}");
+        let again: SavedLayout = serde_json::from_str(&text).unwrap();
+        assert_eq!(again.dock, layout.dock);
     }
 }
 

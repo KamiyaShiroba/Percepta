@@ -1,9 +1,9 @@
 //! Win32 window behaviour: keeping keyboard focus in CSP, and spotting when CSP is in front.
 
-use std::ffi::c_void;
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, VK_LBUTTON,
 };
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateIcon, DispatchMessageW, FindWindowW, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow,
     GetSystemMetrics, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic,
@@ -30,14 +30,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PM_REMOVE, QS_ALLINPUT, SMTO_ABORTIFHUNG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN, STYLESTRUCT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     WINDOWPOS, WINEVENT_OUTOFCONTEXT, WM_MOUSEACTIVATE,
-    WM_NCHITTEST, WM_STYLECHANGING, WM_WINDOWPOSCHANGING, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WM_NCDESTROY, WM_NCHITTEST, WM_STYLECHANGING, WM_WINDOWPOSCHANGING, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST,
 };
 
 use crate::frame;
 
-/// Set while a text field holds the keyboard. There is only one palette window.
-static TYPING: AtomicBool = AtomicBool::new(false);
+/// The windows that stay out of CSP's way. Never hold this while sending a window a
+/// message: its thread may be waiting for this lock.
+static GUARDED: Mutex<Vec<Guarded>> = Mutex::new(Vec::new());
+/// The window to hand the keyboard back to after typing.
+static PREVIOUS_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
 /// Set while the window should act like any other, because the user is not in CSP.
 static ORDINARY_WINDOW: AtomicBool = AtomicBool::new(false);
 /// Set by the foreground event, to wake the thread that keeps the window's level.
@@ -48,13 +51,9 @@ static USE_SECOND_SPOT: AtomicBool = AtomicBool::new(false);
 /// Set while the window is hidden in the tray.
 static CLOAKED: AtomicBool = AtomicBool::new(false);
 
-/// The settings window while it is open, for the thread that follows CSP.
-static SETTINGS_WINDOW: AtomicIsize = AtomicIsize::new(0);
-/// The same as `TYPING`, for the settings window.
-static SETTINGS_TYPING: AtomicBool = AtomicBool::new(false);
-
 /// Why there was nothing to restore, as is normal while the user is in another program.
 pub const CSP_NOT_IN_FRONT: &str = "CSP 不在前台";
+const GUARD_SUBCLASS_ID: usize = 1;
 const HIT_TEST_TIMEOUT_MS: u32 = 50;
 /// A point this far in from the window's corner lies on its title bar.
 const TITLE_BAR_PROBE: i32 = 20;
@@ -70,95 +69,132 @@ const TITLE_ROW_LIMIT: i32 = 60;
 /// Between the main window and the settings window when it opens beside it.
 const WINDOW_GAP: i32 = 8;
 
+/// What the window procedure needs to know about one guarded window.
+struct GuardState {
+    /// Set while a text field in this window holds the keyboard.
+    typing: AtomicBool,
+    /// Off the taskbar and out of Alt+Tab, as the tray icon stands in for both.
+    tool_window: bool,
+}
+
+#[derive(Clone)]
+struct Guarded {
+    hwnd: isize,
+    state: Arc<GuardState>,
+}
+
+/// A snapshot, so that the lock is free again before anything is done with it.
+fn guarded_windows() -> Vec<Guarded> {
+    GUARDED.lock().map_or_else(|_| Vec::new(), |windows| windows.clone())
+}
+
+fn guarded_window(hwnd: isize) -> Option<Guarded> {
+    guarded_windows().into_iter().find(|window| window.hwnd == hwnd)
+}
+
 /// winit rewrites the extended style whenever its own window flags change, and
 /// shows the window with a plain `SW_SHOW` after the first time. Both would undo
 /// a style that was only set once, so these messages are guarded at the source.
-unsafe extern "system" fn palette_proc(
+unsafe extern "system" fn guard_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
     _id: usize,
-    _data: usize,
+    data: usize,
 ) -> LRESULT {
-    // winit rewrites the whole extended style without knowing about the topmost state,
-    // which `follow_csp` sets behind its back.
-    if message == WM_STYLECHANGING && wparam as i32 == GWL_EXSTYLE {
+    // SAFETY: `data` is the reference from `guard_window`, given up only below.
+    let state = unsafe { &*(data as *const GuardState) };
+    if state.tool_window && message == WM_STYLECHANGING && wparam as i32 == GWL_EXSTYLE {
         // SAFETY: for this message Windows passes a valid STYLESTRUCT.
         let style = unsafe { &mut *(lparam as *mut STYLESTRUCT) };
+        // winit rewrites the whole extended style without knowing about the topmost state,
+        // which `follow_csp` sets behind its back.
         style.styleNew = (style.styleNew & !WS_EX_TOPMOST) | (style.styleOld & WS_EX_TOPMOST);
-        // Keeps it off the taskbar and out of Alt+Tab, as the tray icon stands in for both.
         style.styleNew = (style.styleNew & !WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW;
     }
-    if message == WM_MOUSEACTIVATE && keeps_inactive(&TYPING) {
-        return MA_NOACTIVATE as LRESULT;
+    if !state.typing.load(Ordering::Relaxed) && !ORDINARY_WINDOW.load(Ordering::Relaxed) {
+        match message {
+            WM_MOUSEACTIVATE => return MA_NOACTIVATE as LRESULT,
+            WM_STYLECHANGING if wparam as i32 == GWL_EXSTYLE => {
+                // SAFETY: for this message Windows passes a valid STYLESTRUCT.
+                unsafe { (*(lparam as *mut STYLESTRUCT)).styleNew |= WS_EX_NOACTIVATE };
+            }
+            WM_WINDOWPOSCHANGING => {
+                // SAFETY: for this message Windows passes a valid WINDOWPOS.
+                unsafe { (*(lparam as *mut WINDOWPOS)).flags |= SWP_NOACTIVATE };
+            }
+            _ => {}
+        }
     }
-    if keeps_inactive(&TYPING) {
-        guard_activation(message, wparam, lparam);
+    if message == WM_NCDESTROY {
+        if let Ok(mut windows) = GUARDED.lock() {
+            windows.retain(|window| window.hwnd != hwnd as isize);
+        }
+        // SAFETY: the subclass is removed first, so nothing uses the reference after this.
+        unsafe {
+            RemoveWindowSubclass(hwnd, Some(guard_proc), GUARD_SUBCLASS_ID);
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            drop(Arc::from_raw(data as *const GuardState));
+            return result;
+        }
     }
     // SAFETY: forwards the arguments Windows gave us.
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
-/// The settings window stays out of the way of CSP just as the palette does.
-unsafe extern "system" fn settings_proc(
-    hwnd: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    _id: usize,
-    _data: usize,
-) -> LRESULT {
-    if message == WM_MOUSEACTIVATE && keeps_inactive(&SETTINGS_TYPING) {
-        return MA_NOACTIVATE as LRESULT;
+/// From now until it is destroyed, keeps a window from taking the foreground from CSP.
+pub fn guard_window(hwnd: HWND, tool_window: bool) {
+    let state = Arc::new(GuardState { typing: AtomicBool::new(false), tool_window });
+    if let Ok(mut windows) = GUARDED.lock() {
+        windows.push(Guarded { hwnd: hwnd as isize, state: state.clone() });
     }
-    if keeps_inactive(&SETTINGS_TYPING) {
-        guard_activation(message, wparam, lparam);
-    }
-    // SAFETY: forwards the arguments Windows gave us.
-    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
-}
-
-fn keeps_inactive(typing: &AtomicBool) -> bool {
-    !typing.load(Ordering::Relaxed) && !ORDINARY_WINDOW.load(Ordering::Relaxed)
-}
-
-fn guard_activation(message: u32, wparam: WPARAM, lparam: LPARAM) {
-    match message {
-        WM_STYLECHANGING if wparam as i32 == GWL_EXSTYLE => {
-            // SAFETY: for this message Windows passes a valid STYLESTRUCT.
-            unsafe { (*(lparam as *mut STYLESTRUCT)).styleNew |= WS_EX_NOACTIVATE };
-        }
-        WM_WINDOWPOSCHANGING => {
-            // SAFETY: for this message Windows passes a valid WINDOWPOS.
-            unsafe { (*(lparam as *mut WINDOWPOS)).flags |= SWP_NOACTIVATE };
-        }
-        _ => {}
-    }
-}
-
-/// Starts keeping a newly opened settings window from taking the foreground from CSP.
-pub fn adopt_settings(settings: HWND) {
-    SETTINGS_WINDOW.store(settings as isize, Ordering::Relaxed);
-    // SAFETY: called on the thread that owns the window, and the procedure needs no
-    // reference data.
-    unsafe { SetWindowSubclass(settings, Some(settings_proc), 1, 0) };
+    // SAFETY: called on the thread that owns the window. The procedure gives the reference
+    // up when the window is destroyed.
+    unsafe { SetWindowSubclass(hwnd, Some(guard_proc), GUARD_SUBCLASS_ID, Arc::into_raw(state) as usize) };
     if !ORDINARY_WINDOW.load(Ordering::Relaxed) {
-        update_ex_style(settings, |style| style | WS_EX_NOACTIVATE);
+        update_ex_style(hwnd, |style| style | WS_EX_NOACTIVATE);
     }
 }
 
-/// The settings window has closed.
-pub fn forget_settings() {
-    SETTINGS_WINDOW.store(0, Ordering::Relaxed);
+/// Text fields need the keyboard, so while the user is in CSP a window is activated only
+/// while one has focus, and returns the keyboard to CSP afterwards. Returns false if Windows
+/// refused to activate it.
+pub fn set_typing(window: isize, typing: bool) -> bool {
+    let Some(guarded) = guarded_window(window) else { return true };
+    let hwnd = window as HWND;
+    guarded.state.typing.store(typing, Ordering::Relaxed);
+    if typing {
+        update_ex_style(hwnd, |style| style & !WS_EX_NOACTIVATE);
+        // SAFETY: plain Win32 calls; a stale HWND only makes them fail.
+        unsafe {
+            let front = GetForegroundWindow() as isize;
+            // Going straight from a field in one window to a field in another.
+            if guarded_window(front).is_none() {
+                PREVIOUS_FOREGROUND.store(front, Ordering::Relaxed);
+            }
+            SetForegroundWindow(hwnd) != 0
+        }
+    } else {
+        if !ORDINARY_WINDOW.load(Ordering::Relaxed) {
+            update_ex_style(hwnd, |style| style | WS_EX_NOACTIVATE);
+            let previous = PREVIOUS_FOREGROUND.load(Ordering::Relaxed);
+            // SAFETY: as above.
+            unsafe {
+                if GetForegroundWindow() == hwnd && previous != 0 {
+                    SetForegroundWindow(previous as HWND);
+                }
+            }
+        }
+        frame::refresh_shadow(hwnd);
+        true
+    }
 }
 
 /// A window that takes mouse input without becoming the active window, so CSP
 /// keeps its shortcuts while the user works the sliders.
 pub struct PaletteWindow {
     hwnd: isize,
-    /// The window to hand the keyboard back to after typing.
-    previous: isize,
 }
 
 impl PaletteWindow {
@@ -166,15 +202,14 @@ impl PaletteWindow {
         let RawWindowHandle::Win32(handle) = window.window_handle().ok()?.as_raw() else {
             return None;
         };
-        let palette = Self { hwnd: handle.hwnd.get(), previous: 0 };
-        // SAFETY: called on the thread that owns the window, and the procedure
-        // needs no reference data.
-        unsafe {
-            SetWindowSubclass(palette.hwnd as HWND, Some(palette_proc), 1, 0);
-        }
-        update_ex_style(palette.hwnd as HWND, |style| style | WS_EX_NOACTIVATE);
+        let palette = Self { hwnd: handle.hwnd.get() };
+        guard_window(palette.hwnd as HWND, true);
         frame::install(palette.hwnd as HWND, true, palette_shadow_allowed);
         Some(palette)
+    }
+
+    pub fn hwnd(&self) -> isize {
+        self.hwnd
     }
 
     /// Takes the window off the screen, and the keyboard back from it if it had it.
@@ -206,40 +241,6 @@ impl PaletteWindow {
             if ORDINARY_WINDOW.load(Ordering::Relaxed) {
                 SetForegroundWindow(hwnd);
             }
-        }
-    }
-
-    /// Text fields need the keyboard, so while the user is in CSP a window is activated
-    /// only while one has focus, and returns the keyboard to CSP afterwards. `settings` is
-    /// the settings window if that is the one, or else it is this one. Returns false if
-    /// Windows refused to activate it.
-    pub fn set_typing(&mut self, settings: Option<HWND>, typing: bool) -> bool {
-        let hwnd = settings.unwrap_or(self.hwnd as HWND);
-        let flag = if settings.is_some() { &SETTINGS_TYPING } else { &TYPING };
-        flag.store(typing, Ordering::Relaxed);
-        if typing {
-            update_ex_style(hwnd, |style| style & !WS_EX_NOACTIVATE);
-            // SAFETY: plain Win32 calls; a stale HWND only makes them fail.
-            unsafe {
-                let front = GetForegroundWindow() as isize;
-                // Going straight from a field in one window to a field in the other.
-                if front != self.hwnd && front != SETTINGS_WINDOW.load(Ordering::Relaxed) {
-                    self.previous = front;
-                }
-                SetForegroundWindow(hwnd) != 0
-            }
-        } else {
-            if !ORDINARY_WINDOW.load(Ordering::Relaxed) {
-                update_ex_style(hwnd, |style| style | WS_EX_NOACTIVATE);
-                // SAFETY: as above.
-                unsafe {
-                    if GetForegroundWindow() == hwnd && self.previous != 0 {
-                        SetForegroundWindow(self.previous as *mut c_void);
-                    }
-                }
-            }
-            frame::refresh_shadow(hwnd);
-            true
         }
     }
 
@@ -373,7 +374,7 @@ impl PaletteWindow {
                 // the guards stop, so an ordinary window gives them up a little later.
                 let settled_in = shown_at.elapsed() >= ORDINARY_SETTLE_TIME;
                 if mode != applied_mode && (mode == WindowMode::FollowingCsp || settled_in) {
-                    apply_mode(hwnd, mode);
+                    apply_mode(mode);
                     applied_mode = mode;
                 }
 
@@ -429,20 +430,17 @@ fn next_mode(mode: WindowMode, front: Front, settled_away: bool) -> WindowMode {
     }
 }
 
-fn apply_mode(hwnd: HWND, mode: WindowMode) {
+fn apply_mode(mode: WindowMode) {
     let ordinary = mode == WindowMode::Ordinary;
     ORDINARY_WINDOW.store(ordinary, Ordering::Relaxed);
-    let settings = SETTINGS_WINDOW.load(Ordering::Relaxed) as HWND;
-    for (window, typing) in [(hwnd, &TYPING), (settings, &SETTINGS_TYPING)] {
-        if window.is_null() {
-            continue;
-        }
+    for window in guarded_windows() {
+        let hwnd = window.hwnd as HWND;
         if ordinary {
-            update_ex_style(window, |style| style & !WS_EX_NOACTIVATE);
-        } else if !typing.load(Ordering::Relaxed) {
-            update_ex_style(window, |style| style | WS_EX_NOACTIVATE);
+            update_ex_style(hwnd, |style| style & !WS_EX_NOACTIVATE);
+        } else if !window.state.typing.load(Ordering::Relaxed) {
+            update_ex_style(hwnd, |style| style | WS_EX_NOACTIVATE);
         }
-        frame::refresh_shadow(window);
+        frame::refresh_shadow(hwnd);
     }
 }
 
@@ -459,8 +457,9 @@ fn beside(main: RECT, [width, height]: [i32; 2], work: RECT) -> [i32; 2] {
 
 /// The shadow marks the window as really being in use: while typing, or while the user
 /// has come to it from somewhere other than CSP.
-fn palette_shadow_allowed() -> bool {
-    TYPING.load(Ordering::Relaxed) || ORDINARY_WINDOW.load(Ordering::Relaxed)
+fn palette_shadow_allowed(hwnd: HWND) -> bool {
+    let typing = guarded_window(hwnd as isize).is_some_and(|window| window.state.typing.load(Ordering::Relaxed));
+    typing || ORDINARY_WINDOW.load(Ordering::Relaxed)
 }
 
 /// Whether the palette window is hidden in the tray.

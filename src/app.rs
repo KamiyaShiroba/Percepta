@@ -1,6 +1,6 @@
 //! The main window: the colour panels, and the link that keeps them in sync with CSP.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -15,6 +15,7 @@ use crate::csp::client::CspSlots;
 use crate::csp::worker::{Command, Event, Worker};
 use crate::csp::{Rgb, Slot};
 use crate::frame::{self, CORNER_RADIUS, TITLE_BAR_HEIGHT, TITLE_BUTTON_WIDTH};
+use crate::layout::{self, Axis, Node, Panel, DEFAULT_HEIGHTS, MIN_HEIGHTS};
 use crate::picker::{app_icon_pixels, switch, IconButton, Picker};
 use crate::platform::{self, click_csp_title_bar, pen_or_mouse_down, PaletteWindow};
 use crate::session::{CloseAction, SavedColors, SavedLayout, SavedSettings};
@@ -69,14 +70,9 @@ const PANEL_PADDING: f32 = 3.0;
 /// How far from the line between two panels it can be grabbed.
 const SPLITTER_GRAB: f32 = 4.0;
 const SPLITTER_ACTIVE: Color32 = Color32::from_gray(120);
-const PANEL_COUNT: usize = 3;
-/// The colour slots, the wheel and the sliders.
-const MIN_PANEL_HEIGHTS: [f32; PANEL_COUNT] = [60.0, 200.0, 150.0];
-const DEFAULT_PANEL_HEIGHTS: [f32; PANEL_COUNT] = [72.0, 340.0, 160.0];
 pub const DEFAULT_WINDOW_HEIGHT: f32 =
-    TITLE_BAR_HEIGHT + DEFAULT_PANEL_HEIGHTS[0] + DEFAULT_PANEL_HEIGHTS[1] + DEFAULT_PANEL_HEIGHTS[2];
-pub const MIN_WINDOW_HEIGHT: f32 =
-    TITLE_BAR_HEIGHT + MIN_PANEL_HEIGHTS[0] + MIN_PANEL_HEIGHTS[1] + MIN_PANEL_HEIGHTS[2];
+    TITLE_BAR_HEIGHT + DEFAULT_HEIGHTS[0] + DEFAULT_HEIGHTS[1] + DEFAULT_HEIGHTS[2];
+pub const MIN_WINDOW_HEIGHT: f32 = TITLE_BAR_HEIGHT + MIN_HEIGHTS[0] + MIN_HEIGHTS[1] + MIN_HEIGHTS[2];
 /// Room beside the address field for its button.
 const CONNECT_BUTTON_ROOM: f32 = 52.0;
 const LOG_HEIGHT: f32 = 160.0;
@@ -99,14 +95,14 @@ struct Saved<T> {
     due: Option<Instant>,
 }
 
-impl<T: Copy + PartialEq> Saved<T> {
+impl<T: PartialEq> Saved<T> {
     fn new(on_disk: T) -> Self {
         Self { on_disk, due: None }
     }
 
     /// Returns whether `current` should be written now.
-    fn is_due(&mut self, current: T, ctx: &egui::Context) -> bool {
-        if current == self.on_disk {
+    fn is_due(&mut self, current: &T, ctx: &egui::Context) -> bool {
+        if *current == self.on_disk {
             self.due = None;
             return false;
         }
@@ -205,14 +201,14 @@ struct LentKeyboard {
     active: bool,
     /// The user went off to another program, where their click has done the restoring.
     left: bool,
-    /// The user pressed on the other window, which can't take the keyboard by that alone.
+    /// The user pressed on another window, which can't take the keyboard by that alone.
     end_requested: bool,
 }
 
 pub struct App {
     window: Option<PaletteWindow>,
-    keyboard: LentKeyboard,
-    settings_keyboard: LentKeyboard,
+    /// By window.
+    keyboards: HashMap<isize, LentKeyboard>,
     /// Typing ended without the user leaving, so CSP needs the click that makes it resume.
     restore_after_typing: bool,
     settings: SavedSettings,
@@ -253,7 +249,7 @@ pub struct App {
     /// Set once the app is really going, so that closing no longer goes to the tray.
     quitting: bool,
     confirm_update: bool,
-    panel_heights: [f32; PANEL_COUNT],
+    dock: Node,
     dragging_splitter: bool,
 
     blocked: bool,
@@ -292,12 +288,14 @@ impl App {
                 size: None,
                 wheel,
                 slider,
+                dock: None,
                 panels: None,
                 settings_offset: None,
                 settings_size: None,
             });
         picker.set_modes(layout.wheel, layout.slider);
-        let panel_heights = layout.panels.map_or(DEFAULT_PANEL_HEIGHTS, |heights| heights.map(|height| height as f32));
+        let dock = saved_dock(&layout);
+        let (settings_offset, settings_size) = (layout.settings_offset, layout.settings_size);
         let tray = Tray::new(&cc.egui_ctx, app_icon_pixels);
         if let Some(window) = &window {
             if let Some(position) = layout.position {
@@ -312,8 +310,7 @@ impl App {
         }
         let mut app = Self {
             window,
-            keyboard: LentKeyboard::default(),
-            settings_keyboard: LentKeyboard::default(),
+            keyboards: HashMap::new(),
             restore_after_typing: false,
             settings,
             saved_settings: Saved::new(settings),
@@ -338,8 +335,8 @@ impl App {
             settings_open: false,
             settings_hwnd: None,
             settings_position: None,
-            settings_offset: layout.settings_offset,
-            settings_size: layout.settings_size,
+            settings_offset,
+            settings_size,
             settings_icon: IconButton::new(SETTINGS_ICON),
             close_icon: IconButton::new(CLOSE_ICON),
             settings_close_icon: IconButton::new(CLOSE_ICON),
@@ -347,7 +344,7 @@ impl App {
             close_dialog_open: false,
             quitting: false,
             confirm_update: false,
-            panel_heights,
+            dock,
             dragging_splitter: false,
             blocked: false,
             csp_in_front: true,
@@ -370,14 +367,14 @@ impl App {
     }
 
     fn sync_saved_state(&mut self, ctx: &egui::Context) {
-        if self.saved_slots.is_due(self.slots, ctx) {
+        if self.saved_slots.is_due(&self.slots, ctx) {
             self.save_colors();
         }
         let layout = self.current_layout();
-        if self.saved_layout.is_due(layout, ctx) {
+        if self.saved_layout.is_due(&layout, ctx) {
             self.save_layout(layout);
         }
-        if self.saved_settings.is_due(self.settings, ctx) {
+        if self.saved_settings.is_due(&self.settings, ctx) {
             self.save_settings();
         }
     }
@@ -390,13 +387,13 @@ impl App {
             Some((position, size)) => (Some(position), Some(size)),
             None => (saved.position, saved.size),
         };
-        let panels = self.panel_heights.map(|height| height.round() as i32);
         SavedLayout {
             position,
             size,
             wheel,
             slider,
-            panels: Some(panels),
+            dock: Some(self.dock.rounded()),
+            panels: None,
             settings_offset: self.settings_offset,
             settings_size: self.settings_size,
         }
@@ -410,8 +407,9 @@ impl App {
     }
 
     fn save_layout(&mut self, layout: SavedLayout) {
+        let result = session::save_layout(&layout);
         self.saved_layout.written(layout);
-        if let Err(e) = session::save_layout(&layout) {
+        if let Err(e) = result {
             self.log(format!("保存窗口布局失败：{e}"));
         }
     }
@@ -592,7 +590,7 @@ impl App {
     /// the title bar click that makes them resume.
     fn sync_csp_restore(&mut self, ctx: &egui::Context) {
         let finished = frame::take_drag_end() | std::mem::take(&mut self.restore_after_typing);
-        if !self.settings.restore_csp || self.keyboard.typing || self.settings_keyboard.typing {
+        if !self.settings.restore_csp || self.keyboards.values().any(|keyboard| keyboard.typing) {
             self.restore_at = None;
             return;
         }
@@ -624,21 +622,22 @@ impl App {
         }
     }
 
-    /// Lends a window the keyboard only while a text field has focus, or in the settings
-    /// window, while text is selected in the log to be copied. `settings` is the settings
-    /// window if that is the one being asked about, or else it is the main window.
-    fn sync_keyboard(&mut self, ctx: &egui::Context, settings: Option<isize>) {
-        let selecting = settings.is_some() && ctx.plugin::<LabelSelectionState>().lock().has_selection();
+    fn main_hwnd(&self) -> isize {
+        self.window.as_ref().map_or(0, PaletteWindow::hwnd)
+    }
+
+    /// Lends a window the keyboard only while a text field has focus, or where text can be
+    /// `selectable`, while some is selected to be copied.
+    fn sync_keyboard(&mut self, ctx: &egui::Context, hwnd: isize, selectable: bool) {
+        let selecting = selectable && ctx.plugin::<LabelSelectionState>().lock().has_selection();
         let wants_keyboard = ctx.egui_wants_keyboard_input() || selecting;
-        let (lent, other) = if settings.is_some() {
-            (&mut self.settings_keyboard, &mut self.keyboard)
-        } else {
-            (&mut self.keyboard, &mut self.settings_keyboard)
-        };
-        if other.typing && ctx.input(|i| i.pointer.any_pressed()) {
-            other.end_requested = true;
-            ctx.request_repaint();
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            for (_, other) in self.keyboards.iter_mut().filter(|(other, keyboard)| **other != hwnd && keyboard.typing) {
+                other.end_requested = true;
+                ctx.request_repaint();
+            }
         }
+        let lent = self.keyboards.entry(hwnd).or_default();
         let changed = wants_keyboard != lent.typing;
         if changed {
             lent.typing = wants_keyboard;
@@ -654,9 +653,7 @@ impl App {
         lent.left |= left;
         let end = left || std::mem::take(&mut lent.end_requested);
         if changed {
-            let hwnd = settings.map(|hwnd| hwnd as _);
-            let granted = self.window.as_mut().is_none_or(|w| w.set_typing(hwnd, wants_keyboard));
-            if !granted {
+            if !platform::set_typing(hwnd, wants_keyboard) {
                 self.log("Windows 拒绝切换键盘焦点，请再点一次输入框");
             }
         }
@@ -740,62 +737,105 @@ impl App {
         }
     }
 
-    /// The panels fill the window, with a line between them that resizes the one above it.
+    /// The panels fill the window, with lines between them that resize the one before them.
     fn panels_ui(&mut self, ui: &mut egui::Ui) {
         let area = ui.max_rect();
+        let mut dock = std::mem::take(&mut self.dock);
         if !self.dragging_splitter {
-            self.panel_heights = fit_panels(self.panel_heights, area.height());
+            dock.fit(area.width(), area.height());
         }
         let mut changed = false;
-        let mut top = area.top();
-        let mut grow = 0.0;
-        for panel in 0..PANEL_COUNT {
-            let height = self.panel_heights[panel];
-            let rect = egui::Rect::from_min_max(
-                egui::pos2(area.left(), top),
-                egui::pos2(area.right(), top + height),
-            );
-            let content = rect.shrink2(egui::vec2(CONTENT_MARGIN, PANEL_PADDING));
-            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(content));
-            child.set_clip_rect(rect.intersect(ui.clip_rect()));
-            match panel {
-                0 => self.color_header_ui(&mut child),
-                1 => changed |= self.picker.wheel_panel(&mut child, &mut self.color),
-                _ => changed |= self.picker.slider_panel(&mut child, &mut self.color),
-            }
-            top += height;
-            if panel + 1 < PANEL_COUNT {
-                grow += self.splitter_ui(ui, panel, top);
-                top = area.top() + self.panel_heights[..=panel].iter().sum::<f32>();
-            }
-        }
+        let mut grow = egui::Vec2::ZERO;
+        self.node_ui(ui, &mut dock, area, ui.scope_id().with("dock"), &mut changed, &mut grow);
         if changed {
             self.color_edited();
         }
-        if grow > 0.0 {
-            let total: f32 = self.panel_heights.iter().sum();
-            let size = egui::vec2(area.width(), TITLE_BAR_HEIGHT + total);
+        if grow.x > 0.0 || grow.y > 0.0 {
+            let width = dock.total(Axis::Horizontal).unwrap_or(area.width() + grow.x);
+            let height = dock.total(Axis::Vertical).unwrap_or(area.height() + grow.y);
+            let size = egui::vec2(width, TITLE_BAR_HEIGHT + height);
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
+        self.dock = dock;
+    }
+
+    fn node_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        node: &mut Node,
+        rect: egui::Rect,
+        id: egui::Id,
+        changed: &mut bool,
+        grow: &mut egui::Vec2,
+    ) {
+        let (axis, children) = match node {
+            Node::Split { axis, children } => (*axis, children),
+            Node::Tabs { panels, active } => {
+                if let Some(&panel) = panels.get(*active).or(panels.first()) {
+                    *changed |= self.panel_ui(ui, panel, rect);
+                }
+                return;
+            }
+        };
+        let start = along(rect.min, axis);
+        for index in 0..children.len() {
+            let before: f32 = children[..index].iter().map(|child| child.size).sum();
+            let child_rect = span(rect, axis, start + before, start + before + children[index].size);
+            let grown_before = *grow;
+            self.node_ui(ui, &mut children[index].node, child_rect, id.with(index), changed, grow);
+            // A nested split that had the window grow has made this child bigger too.
+            children[index].size += along((*grow - grown_before).to_pos2(), axis);
+            if index + 1 < children.len() {
+                let line = start + before + children[index].size;
+                let delta = self.splitter_ui(ui, rect, axis, line, id.with(("splitter", index)));
+                let grown = layout::drag_line(children, axis, index, delta);
+                match axis {
+                    Axis::Horizontal => grow.x += grown,
+                    Axis::Vertical => grow.y += grown,
+                }
+            }
         }
     }
 
-    /// Returns by how much the window should grow.
-    fn splitter_ui(&mut self, ui: &mut egui::Ui, panel: usize, y: f32) -> f32 {
-        let area = ui.max_rect();
-        let grab = egui::Rect::from_min_max(
-            egui::pos2(area.left(), y - SPLITTER_GRAB),
-            egui::pos2(area.right(), y + SPLITTER_GRAB),
-        );
-        let response = ui
-            .interact(grab, ui.scope_id().with(("splitter", panel)), egui::Sense::drag())
-            .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+    /// Returns whether the colour was changed.
+    fn panel_ui(&mut self, ui: &mut egui::Ui, panel: Panel, rect: egui::Rect) -> bool {
+        let content = rect.shrink2(egui::vec2(CONTENT_MARGIN, PANEL_PADDING));
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(content));
+        child.set_clip_rect(rect.intersect(ui.clip_rect()));
+        match panel {
+            Panel::Slots => {
+                self.color_header_ui(&mut child);
+                false
+            }
+            Panel::Wheel => self.picker.wheel_panel(&mut child, &mut self.color),
+            Panel::Sliders => self.picker.slider_panel(&mut child, &mut self.color),
+        }
+    }
+
+    /// The line at `position` along `axis`, across `area`. Returns how far it was dragged.
+    fn splitter_ui(&mut self, ui: &mut egui::Ui, area: egui::Rect, axis: Axis, position: f32, id: egui::Id) -> f32 {
+        let grab = span(area, axis, position - SPLITTER_GRAB, position + SPLITTER_GRAB);
+        let cursor = match axis {
+            Axis::Horizontal => egui::CursorIcon::ResizeHorizontal,
+            Axis::Vertical => egui::CursorIcon::ResizeVertical,
+        };
+        let response = ui.interact(grab, id, egui::Sense::drag()).on_hover_cursor(cursor);
         let color = if response.hovered() || response.dragged() {
             SPLITTER_ACTIVE
         } else {
             ui.visuals().widgets.noninteractive.bg_stroke.color
         };
-        let line_x = egui::Rangef::new(area.left() + CONTENT_MARGIN, area.right() - CONTENT_MARGIN);
-        ui.painter().hline(line_x, y, egui::Stroke::new(1.0, color));
+        let stroke = egui::Stroke::new(1.0, color);
+        match axis {
+            Axis::Horizontal => {
+                let range = egui::Rangef::new(area.top() + CONTENT_MARGIN, area.bottom() - CONTENT_MARGIN);
+                ui.painter().vline(position, range, stroke);
+            }
+            Axis::Vertical => {
+                let range = egui::Rangef::new(area.left() + CONTENT_MARGIN, area.right() - CONTENT_MARGIN);
+                ui.painter().hline(range, position, stroke);
+            }
+        }
         if response.drag_started() {
             self.dragging_splitter = true;
         }
@@ -805,9 +845,7 @@ impl App {
         if !response.dragged() {
             return 0.0;
         }
-        let (heights, grow) = drag_panel(self.panel_heights, panel, response.drag_delta().y);
-        self.panel_heights = heights;
-        grow
+        along(response.drag_delta().to_pos2(), axis)
     }
 
     fn reset_link(&mut self) {
@@ -914,7 +952,8 @@ impl App {
     fn color_header_ui(&mut self, ui: &mut egui::Ui) {
         let rgb = self.color.rgb8();
         // While the field is being typed in, the user's text must stay as it is.
-        if !self.keyboard.typing {
+        let typing = self.keyboards.get(&self.main_hwnd()).is_some_and(|keyboard| keyboard.typing);
+        if !typing {
             self.hex = to_hex(rgb);
         }
         let mut chosen = None;
@@ -1025,9 +1064,9 @@ impl App {
         let Some(window) = &self.window else { return };
         let Some(hwnd) = self.settings_hwnd else {
             if let Some(hwnd) = platform::find_own_window(SETTINGS_TITLE) {
-                platform::adopt_settings(hwnd);
+                platform::guard_window(hwnd, false);
                 // Only ever active because the user went to it, so its shadow has no conditions.
-                frame::install(hwnd, true, || true);
+                frame::install(hwnd, true, |_| true);
                 window.place_settings(hwnd, self.settings_offset, self.settings_size);
                 self.settings_hwnd = Some(hwnd as isize);
                 self.settings_position = window.settings_placement(hwnd).map(|(position, ..)| position);
@@ -1053,13 +1092,10 @@ impl App {
     fn close_settings(&mut self) {
         if let Some(hwnd) = self.settings_hwnd.take() {
             self.remember_settings_placement(hwnd);
-            if std::mem::take(&mut self.settings_keyboard).typing {
-                if let Some(window) = &mut self.window {
-                    window.set_typing(Some(hwnd as _), false);
-                }
+            if self.keyboards.remove(&hwnd).is_some_and(|keyboard| keyboard.typing) {
+                platform::set_typing(hwnd, false);
                 self.restore_after_typing = true;
             }
-            platform::forget_settings();
         }
         self.settings_position = None;
         self.settings_open = false;
@@ -1081,7 +1117,7 @@ impl App {
         ctx.show_viewport_immediate(id, builder, |ui, _class| {
             self.sync_settings_placement(ui.ctx());
             if let Some(hwnd) = self.settings_hwnd {
-                self.sync_keyboard(ui.ctx(), Some(hwnd));
+                self.sync_keyboard(ui.ctx(), hwnd, true);
             }
             self.sync_csp_restore(ui.ctx());
             let frame = egui::Frame::central_panel(ui.style()).inner_margin(0.0);
@@ -1192,7 +1228,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll_events();
         self.poll_scan(&ctx);
-        self.sync_keyboard(&ctx, None);
+        self.sync_keyboard(&ctx, self.main_hwnd(), false);
         self.sync_csp_restore(&ctx);
         self.sync_saved_state(&ctx);
         self.updater.poll();
@@ -1256,37 +1292,24 @@ fn window_edge(ui: &egui::Ui) {
     );
 }
 
-/// Makes the panels fill `total`. Spare room goes to the last one, and a shortage comes
-/// from the last one first, as far as the minimum heights allow.
-fn fit_panels(mut heights: [f32; PANEL_COUNT], total: f32) -> [f32; PANEL_COUNT] {
-    for (height, min) in heights.iter_mut().zip(MIN_PANEL_HEIGHTS) {
-        *height = height.max(min);
-    }
-    let mut spare = total - heights.iter().sum::<f32>();
-    if spare >= 0.0 {
-        heights[PANEL_COUNT - 1] += spare;
-        return heights;
-    }
-    for (height, min) in heights.iter_mut().zip(MIN_PANEL_HEIGHTS).rev() {
-        let taken = (*height - min).min(-spare);
-        *height -= taken;
-        spare += taken;
-    }
-    heights
+/// What the saved layout says about the panels, or failing that, the default arrangement.
+fn saved_dock(layout: &SavedLayout) -> Node {
+    let upgraded = layout.panels.map(|heights| Node::stack(heights.map(|height| height as f32)));
+    layout.dock.clone().or(upgraded).filter(Node::is_complete).unwrap_or_default()
 }
 
-/// Applies dragging the line below `panel` by `delta`. Returns the new heights, and by how
-/// much the window should grow. A panel that grows makes the window taller, while one that
-/// shrinks hands its room to the last panel and leaves the window as it is.
-fn drag_panel(mut heights: [f32; PANEL_COUNT], panel: usize, delta: f32) -> ([f32; PANEL_COUNT], f32) {
-    let new_height = (heights[panel] + delta).max(MIN_PANEL_HEIGHTS[panel]);
-    let change = new_height - heights[panel];
-    heights[panel] = new_height;
-    if change < 0.0 {
-        heights[PANEL_COUNT - 1] -= change;
-        (heights, 0.0)
-    } else {
-        (heights, change)
+fn along(point: egui::Pos2, axis: Axis) -> f32 {
+    match axis {
+        Axis::Horizontal => point.x,
+        Axis::Vertical => point.y,
+    }
+}
+
+/// The part of `rect` from `start` to `end` along `axis`, and all of it across.
+fn span(rect: egui::Rect, axis: Axis, start: f32, end: f32) -> egui::Rect {
+    match axis {
+        Axis::Horizontal => egui::Rect::from_x_y_ranges(start..=end, rect.y_range()),
+        Axis::Vertical => egui::Rect::from_x_y_ranges(rect.x_range(), start..=end),
     }
 }
 
@@ -1384,23 +1407,25 @@ mod tests {
     }
 
     #[test]
-    fn panels_fill_the_window_and_only_give_way_down_to_their_minimums() {
-        assert_eq!(fit_panels([72.0, 340.0, 208.0], 720.0), [72.0, 340.0, 308.0]);
-        assert_eq!(fit_panels([72.0, 340.0, 208.0], 570.0), [72.0, 340.0, 158.0]);
-        // The last panel gives way first, then the one above it.
-        assert_eq!(fit_panels([72.0, 340.0, 208.0], 500.0), [72.0, 278.0, 150.0]);
-        assert_eq!(fit_panels([72.0, 340.0, 208.0], 410.0), [60.0, 200.0, 150.0]);
-        // A saved height below the minimum is raised.
-        assert_eq!(fit_panels([10.0, 200.0, 150.0], 410.0), [60.0, 200.0, 150.0]);
-    }
+    fn a_layout_from_1_0_1_keeps_its_heights_and_damaged_ones_fall_back() {
+        let (wheel, slider) = Picker::default().modes();
+        let mut layout = SavedLayout {
+            position: None,
+            size: None,
+            wheel,
+            slider,
+            dock: None,
+            panels: Some([80, 300, 170]),
+            settings_offset: None,
+            settings_size: None,
+        };
+        assert_eq!(saved_dock(&layout), Node::stack([80.0, 300.0, 170.0]));
 
-    #[test]
-    fn growing_a_panel_grows_the_window_but_shrinking_one_does_not() {
-        let heights = [72.0, 340.0, 208.0];
-        assert_eq!(drag_panel(heights, 1, 30.0), ([72.0, 370.0, 208.0], 30.0));
-        assert_eq!(drag_panel(heights, 1, -30.0), ([72.0, 310.0, 238.0], 0.0));
-        // Stops at the minimum, and the rest of the drag does nothing.
-        assert_eq!(drag_panel(heights, 0, -30.0), ([60.0, 340.0, 220.0], 0.0));
+        layout.dock = Some(Node::stack([90.0, 310.0, 180.0]));
+        assert_eq!(saved_dock(&layout), Node::stack([90.0, 310.0, 180.0]));
+
+        layout.dock = Some(Node::Tabs { panels: vec![Panel::Wheel], active: 0 });
+        assert_eq!(saved_dock(&layout), Node::default());
     }
 
     #[test]

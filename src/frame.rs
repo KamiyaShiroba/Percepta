@@ -79,7 +79,7 @@ fn zone_at(x: f32, y: f32, width: f32, height: f32, scale: f32, resizable: bool)
 struct FrameState {
     shadow: HWND,
     /// Asked on top of the window being active.
-    shadow_allowed: fn() -> bool,
+    shadow_allowed: fn(HWND) -> bool,
     resizable: bool,
     /// The window size the region was made for.
     region_size: (i32, i32),
@@ -95,7 +95,7 @@ struct FrameState {
 }
 
 /// Gives a borderless window its frame. Lasts until the window is destroyed.
-pub fn install(hwnd: HWND, resizable: bool, shadow_allowed: fn() -> bool) {
+pub fn install(hwnd: HWND, resizable: bool, shadow_allowed: fn(HWND) -> bool) {
     let state = Box::new(FrameState {
         shadow: create_shadow_window(),
         shadow_allowed,
@@ -301,7 +301,7 @@ pub fn refresh_shadow(hwnd: HWND) {
 
 fn update_shadow(hwnd: HWND, state: &mut FrameState) {
     // SAFETY: takes no pointers, and a stale handle reads as not visible.
-    let shown = state.active && (state.shadow_allowed)() && unsafe { IsWindowVisible(hwnd) } != 0 && !is_cloaked(hwnd);
+    let shown = state.active && (state.shadow_allowed)(hwnd) && unsafe { IsWindowVisible(hwnd) } != 0 && !is_cloaked(hwnd);
     if !shown {
         // SAFETY: a stale handle only fails.
         unsafe { ShowWindow(state.shadow, SW_HIDE) };

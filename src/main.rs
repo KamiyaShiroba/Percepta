@@ -5,6 +5,7 @@ mod color;
 mod csp;
 mod frame;
 mod icc;
+mod layout;
 mod picker;
 mod platform;
 mod qr;
