@@ -16,10 +16,10 @@ use crate::csp::client::CspSlots;
 use crate::csp::worker::{Command, Event, Worker};
 use crate::csp::{Rgb, Slot};
 use crate::frame::{self, CORNER_RADIUS, DRAG_THRESHOLD, TITLE_BAR_HEIGHT, TITLE_BUTTON_WIDTH};
-use crate::layout::{self, Axis, Drop as DockDrop, Node, Panel, DEFAULT_HEIGHTS, MIN_HEIGHTS, MODULE_TITLE_HEIGHT};
+use crate::layout::{self, Axis, Drop as DockDrop, Home, Node, Panel, DEFAULT_HEIGHTS, MODULE_TITLE_HEIGHT, PANELS};
 use crate::picker::{app_icon_pixels, switch, IconButton, Picker};
 use crate::platform::{self, click_csp_title_bar, pen_or_mouse_down, PaletteWindow};
-use crate::session::{CloseAction, SavedColors, SavedLayout, SavedSettings};
+use crate::session::{HiddenPanel, SavedColors, SavedLayout, SavedSettings, SavedWindow};
 use crate::tray::{self, Tray};
 use crate::update::{self, Updater};
 use crate::{qr, session};
@@ -61,6 +61,8 @@ const SETTINGS_SIZE: [f32; 2] = [320.0, 520.0];
 const SETTINGS_MIN_SIZE: [f32; 2] = [240.0, 300.0];
 /// A hidden window only needs to keep up with CSP's reports now and then.
 const HIDDEN_REPAINT_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the numbers in the settings window are brought up to date.
+const STATS_REFRESH: Duration = Duration::from_secs(1);
 const TITLE_BAR_FILL: Color32 = Color32::from_gray(232);
 const TITLE_TEXT: Color32 = Color32::from_gray(90);
 const TITLE_FONT_SIZE: f32 = 12.0;
@@ -86,11 +88,9 @@ const SPLITTER_GRAB: f32 = 4.0;
 const SPLITTER_ACTIVE: Color32 = Color32::from_gray(120);
 pub const DEFAULT_WINDOW_HEIGHT: f32 =
     TITLE_BAR_HEIGHT + DEFAULT_HEIGHTS[0] + DEFAULT_HEIGHTS[1] + DEFAULT_HEIGHTS[2];
-pub const MIN_WINDOW_HEIGHT: f32 = TITLE_BAR_HEIGHT + MIN_HEIGHTS[0] + MIN_HEIGHTS[1] + MIN_HEIGHTS[2];
 /// Room beside the address field for its button.
 const CONNECT_BUTTON_ROOM: f32 = 52.0;
 const LOG_HEIGHT: f32 = 160.0;
-const CLOSE_DIALOG_WIDTH: f32 = 220.0;
 const CHECKER_SIZE: f32 = 6.0;
 const CHECKER_LIGHT: Color32 = Color32::from_gray(235);
 const CHECKER_DARK: Color32 = Color32::from_gray(190);
@@ -102,6 +102,11 @@ const UPDATE_DOT_RADIUS: f32 = 3.0;
 const SAVE_DELAY: Duration = Duration::from_secs(1);
 const SETTINGS_ICON: &str = include_str!("../assets/settings.svg");
 const CLOSE_ICON: &str = include_str!("../assets/close.svg");
+const MENU_ICON: &str = include_str!("../assets/menu.svg");
+/// The window eframe opens, which is the one that always exists, closed or not.
+const MAIN_WINDOW: u64 = 0;
+/// How far a window that has no place of its own opens from the first one, in physical pixels.
+const NEW_WINDOW_OFFSET: i32 = 40;
 
 /// A value that is written to disk some time after it last changed.
 struct Saved<T> {
@@ -219,34 +224,117 @@ struct LentKeyboard {
     end_requested: bool,
 }
 
-/// A window of its own, holding a panel or a stack of tabs.
-struct FloatingWindow {
+/// A window that holds panels. Closing one keeps it here, with its arrangement and place.
+struct PanelWindow {
     id: u64,
     node: Node,
-    /// Once it has been found and given its frame.
+    open: bool,
+    /// Once it has been found and given its frame. Gone with the window when it closes.
     hwnd: Option<isize>,
-    /// Where to put it when it first appears, in physical pixels.
-    position: [i32; 2],
-    /// When it first appears.
-    size: egui::Vec2,
+    /// Its top-left corner and outer size in physical pixels, once it has any.
+    position: Option<[i32; 2]>,
+    size: Option<[i32; 2]>,
+    /// Its inside when it appears with no size on record.
+    first_size: egui::Vec2,
+    scale: f32,
+    /// Its inside when it was last drawn.
+    inner: egui::Vec2,
+    /// What its minimum was last set to.
+    min_size: egui::Vec2,
+    /// What to set its inside to the next time it is drawn.
+    resize_to: Option<egui::Vec2>,
+    /// It has just been made bigger, which the next frame to be drawn doesn't know about yet.
+    grown: bool,
     close_icon: IconButton,
+    menu_icon: IconButton,
 }
 
-impl FloatingWindow {
+impl PanelWindow {
+    fn new(id: u64, node: Node, scale: f32) -> Self {
+        Self {
+            id,
+            node,
+            open: true,
+            hwnd: None,
+            position: None,
+            size: None,
+            first_size: egui::Vec2::ZERO,
+            scale,
+            inner: egui::Vec2::ZERO,
+            min_size: egui::Vec2::ZERO,
+            resize_to: None,
+            grown: false,
+            close_icon: IconButton::new(CLOSE_ICON),
+            menu_icon: IconButton::new(MENU_ICON),
+        }
+    }
+
     fn title(&self) -> String {
         format!("Percepta 窗口 {}", self.id)
+    }
+
+    /// A lone stack has no title bar on top of its title strip.
+    fn title_height(node: &Node) -> f32 {
+        if matches!(node, Node::Tabs { .. }) { 0.0 } else { TITLE_BAR_HEIGHT }
+    }
+
+    fn min_inner(&self) -> egui::Vec2 {
+        let height = Self::title_height(&self.node) + self.node.min_size(Axis::Vertical);
+        egui::vec2(self.node.min_size(Axis::Horizontal), height)
+    }
+
+    /// Makes a window longer at once, so that the next time it is drawn there is room for what
+    /// has just been added. Then nothing else has to give way.
+    fn grow(&mut self, axis: Axis, by: f32) {
+        self.grown = true;
+        let by = (by * self.scale).round() as i32;
+        let grown = |[width, height]: [i32; 2]| match axis {
+            Axis::Horizontal => [width + by, height],
+            Axis::Vertical => [width, height + by],
+        };
+        match (self.size, self.hwnd) {
+            (Some(size), hwnd) => {
+                self.size = Some(grown(size));
+                if let Some(hwnd) = hwnd {
+                    platform::resize_window(hwnd as _, grown(size));
+                }
+            }
+            (None, _) => match axis {
+                Axis::Horizontal => self.first_size.x += by as f32 / self.scale,
+                Axis::Vertical => self.first_size.y += by as f32 / self.scale,
+            },
+        }
+    }
+
+    /// Makes a window shorter, once it has been told its new minimum.
+    fn shrink(&mut self, axis: Axis, by: f32) {
+        self.resize_to = Some(match axis {
+            Axis::Horizontal => self.inner - egui::vec2(by, 0.0),
+            Axis::Vertical => self.inner - egui::vec2(0.0, by),
+        });
+    }
+
+    fn to_saved(&self) -> SavedWindow {
+        SavedWindow { id: self.id, node: self.node.rounded(), open: self.open, position: self.position, size: self.size }
     }
 }
 
 /// A panel or a stack of tabs on its way somewhere, while the layout stays as it is.
 struct PanelDrag {
-    /// The window it comes from, or `None` for the main window.
-    source: Option<u64>,
+    /// The window it comes from.
+    source: u64,
     panels: Vec<Panel>,
     /// The area it fills now, at 100% scale.
     size: egui::Vec2,
     /// How far into that area the pointer holds it, in physical pixels.
     grab: [i32; 2],
+}
+
+/// Which window something is being drawn in.
+#[derive(Clone, Copy)]
+struct Host {
+    id: u64,
+    hwnd: isize,
 }
 
 /// Where a stack of tabs in the main window is, at 100% scale from the window's corner.
@@ -293,28 +381,25 @@ pub struct App {
     settings_offset: Option<[i32; 2]>,
     settings_size: Option<[i32; 2]>,
     settings_icon: IconButton,
-    /// One for each window, as they can sit on monitors of different scales.
-    close_icon: IconButton,
     settings_close_icon: IconButton,
     tray: Option<Tray>,
-    close_dialog_open: bool,
-    /// Set once the app is really going, so that closing no longer goes to the tray.
+    /// Set once the app is really going.
     quitting: bool,
     confirm_update: bool,
-    dock: Node,
+    /// The first of these is the main window, which is always here.
+    windows: Vec<PanelWindow>,
+    /// Panels taken out on their own, the latest last.
+    hidden: Vec<HiddenPanel>,
     dragging_splitter: bool,
-    floating: Vec<FloatingWindow>,
     next_window_id: u64,
     dragging: Option<PanelDrag>,
     ghost: frame::DragGhost,
     /// The window that the ghost is standing in for, until it appears.
     ghost_until: Option<u64>,
-    /// Floating windows to take back into the main window.
-    docking_back: Vec<u64>,
+    /// Windows to close and panels to show or hide, once the frame has been drawn.
+    closing: Vec<u64>,
+    toggling: Vec<Panel>,
     dock_targets: Vec<DockTarget>,
-    main_scale: f32,
-    /// The height that the main window's minimum was last set for.
-    main_min_height: f32,
     drop_indicator: frame::DropIndicator,
 
     blocked: bool,
@@ -355,19 +440,37 @@ impl App {
                 slider,
                 dock: None,
                 panels: None,
+                main_open: true,
+                floating: Vec::new(),
+                hidden: Vec::new(),
                 settings_offset: None,
                 settings_size: None,
             });
         picker.set_modes(layout.wheel, layout.slider);
-        let dock = saved_dock(&layout);
+        let (dock, floating, hidden) = saved_windows(&layout);
         let (settings_offset, settings_size) = (layout.settings_offset, layout.settings_size);
         let tray = Tray::new(&cc.egui_ctx, app_icon_pixels);
         if let Some(window) = &window {
             if let Some(position) = layout.position {
-                window.restore_placement(position, layout.size);
+                platform::restore_placement(window.hwnd() as _, position, layout.size);
             }
             window.follow_csp();
         }
+        let scale = cc.egui_ctx.pixels_per_point();
+        let mut main = PanelWindow::new(MAIN_WINDOW, dock, scale);
+        main.hwnd = window.as_ref().map(PaletteWindow::hwnd);
+        main.position = layout.position;
+        main.size = layout.size;
+        main.open = layout.main_open;
+        let mut windows = vec![main];
+        windows.extend(floating.into_iter().map(|saved| {
+            let mut window = PanelWindow::new(saved.id, saved.node, scale);
+            window.open = saved.open;
+            window.position = saved.position;
+            window.size = saved.size;
+            window
+        }));
+        let next_window_id = windows.iter().map(|window| window.id).max().unwrap_or(MAIN_WINDOW) + 1;
         let settings = session::load_settings();
         let mut updater = Updater::new();
         if settings.check_updates {
@@ -403,23 +506,20 @@ impl App {
             settings_offset,
             settings_size,
             settings_icon: IconButton::new(SETTINGS_ICON),
-            close_icon: IconButton::new(CLOSE_ICON),
             settings_close_icon: IconButton::new(CLOSE_ICON),
             tray,
-            close_dialog_open: false,
             quitting: false,
             confirm_update: false,
-            dock,
+            windows,
+            hidden,
             dragging_splitter: false,
-            floating: Vec::new(),
-            next_window_id: 1,
+            next_window_id,
             dragging: None,
             ghost: frame::DragGhost::new(),
             ghost_until: None,
-            docking_back: Vec::new(),
+            closing: Vec::new(),
+            toggling: Vec::new(),
             dock_targets: Vec::new(),
-            main_scale: 1.0,
-            main_min_height: 0.0,
             drop_indicator: frame::DropIndicator::new(),
             blocked: false,
             csp_in_front: true,
@@ -434,6 +534,16 @@ impl App {
             log: VecDeque::new(),
             saved: session::load(),
         };
+        // Started by hand with nothing to show would look like it had not started.
+        if app.windows.iter().any(|window| window.open) {
+            if !app.windows[0].open {
+                if let Some(window) = &app.window {
+                    window.hide();
+                }
+            }
+        } else {
+            app.show_all();
+        }
         // The saved colours show until CSP's first report replaces them.
         if let Some(saved) = app.saved.clone() {
             app.connect(&cc.egui_ctx, saved, true);
@@ -456,34 +566,30 @@ impl App {
 
     fn current_layout(&self) -> SavedLayout {
         let (wheel, slider) = self.picker.modes();
-        // Keep the last good placement while the window has none to report.
-        let saved = &self.saved_layout.on_disk;
-        let (position, size) = match self.window.as_ref().and_then(PaletteWindow::placement) {
-            Some((position, size)) => (Some(position), Some(size)),
-            None => (saved.position, saved.size),
-        };
+        let main = &self.windows[0];
         SavedLayout {
-            position,
-            size,
+            position: main.position,
+            size: main.size,
             wheel,
             slider,
-            dock: Some(self.dock_with_floating().rounded()),
+            dock: Some(main.node.rounded()),
             panels: None,
+            main_open: main.open,
+            floating: self.windows[1..].iter().map(PanelWindow::to_saved).collect(),
+            hidden: self.hidden.clone(),
             settings_offset: self.settings_offset,
             settings_size: self.settings_size,
         }
     }
 
-    /// Floating windows don't outlive the app yet, so what is saved has their panels back
-    /// in the main window.
-    fn dock_with_floating(&self) -> Node {
-        let mut dock = self.dock.clone();
-        for panels in self.floating.iter().map(|window| window.node.panels()) {
-            if let Some(&last) = dock.panels().last() {
-                dock.dock(last, DockDrop::Side { axis: Axis::Vertical, before: false }, panels);
+    /// Notes where each window is, for after it has closed.
+    fn sync_placements(&mut self) {
+        for window in self.windows.iter_mut().filter(|window| window.open) {
+            if let Some((position, size)) = window.hwnd.and_then(|hwnd| platform::placement(hwnd as _)) {
+                window.position = Some(position);
+                window.size = Some(size);
             }
         }
-        dock
     }
 
     fn save_colors(&mut self) {
@@ -520,7 +626,7 @@ impl App {
         self.link = Link::Connecting;
         let ctx = ctx.clone();
         self.worker = Some(Worker::spawn(pairing, reconnect, self.event_tx.clone(), move || {
-            if platform::is_cloaked() {
+            if platform::all_closed() {
                 ctx.request_repaint_after(HIDDEN_REPAINT_INTERVAL);
             } else {
                 ctx.request_repaint();
@@ -676,7 +782,7 @@ impl App {
     /// After the pen lifts from this window, hands CSP and the tablet driver
     /// the title bar click that makes them resume.
     fn sync_csp_restore(&mut self, ctx: &egui::Context) {
-        let finished = frame::take_drag_end() | std::mem::take(&mut self.restore_after_typing);
+        let finished = frame::take_drag_end() | tray::take_menu_end() | std::mem::take(&mut self.restore_after_typing);
         if !self.settings.restore_csp || self.keyboards.values().any(|keyboard| keyboard.typing) {
             self.restore_at = None;
             return;
@@ -692,6 +798,12 @@ impl App {
             self.restore_at = Some(earliest.map_or(now, |t| t.max(now)));
         }
         let Some(mut at) = self.restore_at else { return };
+        // The click takes the cursor away for a moment, and where a drag lands is read from
+        // the cursor. It also needs what was dragged to have settled in its new window.
+        if self.dragging.is_some() || self.ghost_until.is_some() {
+            ctx.request_repaint_after(RESTORE_POLL);
+            return;
+        }
         if pen_or_mouse_down() {
             at = at.max(Instant::now() + RESTORE_QUIET);
             self.restore_at = Some(at);
@@ -759,28 +871,6 @@ impl App {
         }
     }
 
-    fn hide_to_tray(&mut self) {
-        if let Some(window) = &self.window {
-            window.hide();
-        }
-        self.cloak_floating(true);
-    }
-
-    fn cloak_floating(&self, cloaked: bool) {
-        for hwnd in self.floating.iter().filter_map(|window| window.hwnd) {
-            frame::set_cloaked(hwnd as _, cloaked);
-        }
-    }
-
-    /// The close button, or anything else that asks the window to close.
-    fn close_requested(&mut self, ctx: &egui::Context) {
-        match self.settings.close_action {
-            None => self.close_dialog_open = true,
-            Some(CloseAction::MinimizeToTray) if self.tray.is_some() => self.hide_to_tray(),
-            Some(_) => self.quit(ctx),
-        }
-    }
-
     fn quit(&mut self, ctx: &egui::Context) {
         self.quitting = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -788,83 +878,231 @@ impl App {
 
     fn poll_tray(&mut self, ctx: &egui::Context) {
         match tray::take_request() {
-            Some(tray::Request::Show) => {
-                if let Some(window) = &self.window {
-                    window.show();
-                }
-                self.cloak_floating(false);
-            }
+            Some(tray::Request::Show) => self.show_all(),
             Some(tray::Request::Settings) => self.settings_open = true,
             Some(tray::Request::Quit) => self.quit(ctx),
+            Some(tray::Request::TogglePanel(panel)) => self.toggling.push(panel),
             None => {}
         }
     }
 
-    /// Asked once, the first time the window is closed.
-    fn close_dialog_ui(&mut self, ctx: &egui::Context, ui: &egui::Ui) {
-        let modal = egui::Modal::new(ui.scope_id().with("close")).show(ctx, |ui| {
-            ui.set_max_width(CLOSE_DIALOG_WIDTH);
-            ui.label(RichText::new("关闭 Percepta").strong());
-            ui.label("要最小化到托盘，还是直接退出？以后可以在设置里改。");
-            ui.label(RichText::new("托盘图标在任务栏右下角，可能收在小箭头里。").small());
-            ui.add_space(4.0);
-            let mut chosen = None;
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("最小化到托盘").clicked() {
-                    chosen = Some(CloseAction::MinimizeToTray);
-                }
-                if ui.button("直接退出").clicked() {
-                    chosen = Some(CloseAction::Quit);
-                }
-                if ui.button("取消").clicked() {
-                    self.close_dialog_open = false;
-                }
-            });
-            chosen
-        });
-        if modal.should_close() {
-            self.close_dialog_open = false;
+    /// Everything that changes which windows exist, once they are not being drawn.
+    fn apply_window_changes(&mut self, ctx: &egui::Context) {
+        self.poll_tray(ctx);
+        for id in std::mem::take(&mut self.closing) {
+            self.close_window(id);
         }
-        if let Some(action) = modal.inner {
-            self.close_dialog_open = false;
-            self.settings.close_action = Some(action);
-            self.close_requested(ctx);
+        for panel in std::mem::take(&mut self.toggling) {
+            self.toggle_panel(panel);
+        }
+        let open = self.windows.iter().filter(|window| window.open);
+        let shown: Vec<Panel> = open.flat_map(|window| window.node.panels()).collect();
+        tray::set_shown_panels(|panel| shown.contains(&panel));
+        platform::set_all_closed(shown.is_empty());
+        // With no tray to come back from, closing the last window can only mean leaving.
+        if shown.is_empty() && self.tray.is_none() {
+            self.quit(ctx);
         }
     }
 
-    /// The panels fill the window, with lines between them that resize the one before them.
-    fn panels_ui(&mut self, ui: &mut egui::Ui) {
-        let area = ui.max_rect();
-        self.main_scale = ui.ctx().pixels_per_point();
-        self.dock_targets.clear();
-        let mut dock = std::mem::take(&mut self.dock);
-        let min_height = dock.min_size(Axis::Vertical);
-        if min_height != self.main_min_height {
-            self.main_min_height = min_height;
-            let size = egui::vec2(dock.min_size(Axis::Horizontal), TITLE_BAR_HEIGHT + min_height);
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
+    fn close_window(&mut self, id: u64) {
+        let Some(window) = self.windows.iter_mut().find(|window| window.id == id && window.open) else { return };
+        window.open = false;
+        if id == MAIN_WINDOW {
+            // It stays alive to keep the UI running, so its edit just has to end.
+            let hwnd = window.hwnd.unwrap_or(0);
+            if let Some(keyboard) = self.keyboards.get_mut(&hwnd).filter(|keyboard| keyboard.typing) {
+                keyboard.end_requested = true;
+            }
+            if let Some(window) = &self.window {
+                window.hide();
+            }
+        } else if let Some(hwnd) = window.hwnd.take() {
+            if self.keyboards.remove(&hwnd).is_some_and(|keyboard| keyboard.typing) {
+                platform::set_typing(hwnd, false);
+                self.restore_after_typing = true;
+            }
         }
-        // Windows only applies a minimum the next time the window is resized.
-        if area.height() + 0.5 < min_height {
-            let size = egui::vec2(area.width(), TITLE_BAR_HEIGHT + min_height);
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+    }
+
+    fn open_window(&mut self, index: usize) {
+        let window = &mut self.windows[index];
+        window.open = true;
+        if window.id == MAIN_WINDOW {
+            if let Some(window) = &self.window {
+                window.show();
+            }
         }
-        if !self.dragging_splitter {
-            dock.fit(area.width(), area.height());
+    }
+
+    /// A panel's window is closed if the panel is all it holds, and otherwise the panel leaves
+    /// it alone. Closed or hidden, it comes back the way it left.
+    fn toggle_panel(&mut self, panel: Panel) {
+        if let Some(index) = self.hidden.iter().position(|hidden| hidden.panel == panel) {
+            let hidden = self.hidden.remove(index);
+            self.restore_panel(hidden);
+            return;
         }
+        let Some(index) = self.windows.iter().position(|window| window.node.panels().contains(&panel)) else { return };
+        if !self.windows[index].open {
+            self.open_window(index);
+            return;
+        }
+        let window = &mut self.windows[index];
+        let title = PanelWindow::title_height(&window.node);
+        let Some(home) = window.node.hide(panel) else {
+            let id = window.id;
+            self.close_window(id);
+            return;
+        };
+        if let (Some(size), DockDrop::Side { axis, .. }) = (home.size, home.drop) {
+            let by = size + title - PanelWindow::title_height(&window.node);
+            window.shrink(axis, by);
+        }
+        self.hidden.push(HiddenPanel { panel, window: window.id, home });
+    }
+
+    fn restore_panel(&mut self, hidden: HiddenPanel) {
+        let HiddenPanel { panel, window: id, home } = hidden;
+        let holds = |window: &PanelWindow, panel| window.node.panels().contains(&panel);
+        // Beside the same panel, wherever that has gone. If that is hidden too, then still in
+        // the same window, if that is still around.
+        let beside = self.windows.iter().position(|window| holds(window, home.beside));
+        let place = beside.map(|index| (index, home)).or_else(|| {
+            let index = self.windows.iter().position(|window| window.id == id)?;
+            let &last = self.windows[index].node.panels().last()?;
+            let drop = DockDrop::Side { axis: Axis::Vertical, before: false };
+            Some((index, Home { beside: last, drop, size: home.size }))
+        });
+        let Some((index, home)) = place else {
+            self.new_window_for(panel);
+            return;
+        };
+        let window = &mut self.windows[index];
+        let title = PanelWindow::title_height(&window.node);
+        let own = |axis| match axis {
+            Axis::Horizontal => window.inner.x,
+            Axis::Vertical => window.inner.y,
+        };
+        let axis = if let DockDrop::Side { axis, .. } = home.drop { axis } else { Axis::Vertical };
+        let own = own(axis);
+        window.node.restore(panel, home, own);
+        if let (Some(size), DockDrop::Side { .. }) = (home.size, home.drop) {
+            window.grow(axis, size + PanelWindow::title_height(&window.node) - title);
+        }
+        if !window.open {
+            self.open_window(index);
+        }
+    }
+
+    /// For a panel that has nothing left to go back to.
+    fn new_window_for(&mut self, panel: Panel) {
+        let mut window = PanelWindow::new(self.next_window_id, Node::tabs(vec![panel]), self.windows[0].scale);
+        self.next_window_id += 1;
+        window.first_size = window.min_inner();
+        window.position = self.windows[0].position.map(|[x, y]| [x + NEW_WINDOW_OFFSET, y + NEW_WINDOW_OFFSET]);
+        self.windows.push(window);
+    }
+
+    /// Every window and panel, and in front of everything else.
+    fn show_all(&mut self) {
+        while let Some(hidden) = self.hidden.pop() {
+            self.restore_panel(hidden);
+        }
+        for index in 0..self.windows.len() {
+            if !self.windows[index].open {
+                self.open_window(index);
+            }
+        }
+        for hwnd in self.windows.iter().filter_map(|window| window.hwnd) {
+            platform::bring_up(hwnd as _);
+        }
+    }
+
+    /// All that is in a window: its title bar, and its panels filling the rest with lines
+    /// between them that resize the one before them. A lone stack's title strip is the bar.
+    fn window_ui(&mut self, ui: &mut egui::Ui, window: &mut PanelWindow, hwnd: isize) {
+        let rect = ui.max_rect();
+        let id = ui.scope_id().with("window");
+        let host = Host { id: window.id, hwnd };
+        let ctx = ui.ctx().clone();
+        window.scale = ctx.pixels_per_point();
+        window.inner = rect.size();
+        if window.id == MAIN_WINDOW {
+            self.dock_targets.clear();
+        }
+        let min_size = window.min_inner();
+        if min_size != window.min_size {
+            window.min_size = min_size;
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min_size));
+        }
+        let grown = std::mem::take(&mut window.grown);
+        if let Some(size) = window.resize_to.take() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size.max(min_size)));
+        } else if rect.height() + 0.5 < min_size.y && !grown {
+            // Windows only applies a minimum the next time the window is resized.
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(rect.width(), min_size.y)));
+        }
+
+        let bar = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), TITLE_BAR_HEIGHT));
+        let below = egui::Rect::from_min_max(egui::pos2(rect.left(), bar.bottom()), rect.max);
+        ui.painter().rect_filled(bar, 0.0, TITLE_BAR_FILL);
+        let menu = egui::Rect::from_min_size(bar.min, egui::vec2(TITLE_BUTTON_WIDTH, bar.height()));
+        if window.menu_icon.show_in(ui, menu, id.with("menu")) {
+            let [x, y] = frame::window_origin(hwnd as _);
+            tray::open_menu([x + (menu.left() * window.scale) as i32, y + (menu.bottom() * window.scale) as i32]);
+            // Not until the menu has closed: a click on CSP would close it.
+            self.restore_at = None;
+        }
+        let mut caption_left = menu.right() - rect.left();
         let mut changed = false;
-        let mut grow = egui::Vec2::ZERO;
-        self.node_ui(ui, &mut dock, area, ui.scope_id().with("dock"), &mut changed, &mut grow, None);
+        match &mut window.node {
+            Node::Tabs { panels, active } => {
+                let strip = egui::Rect::from_min_max(egui::pos2(menu.right(), bar.top()), bar.max);
+                let (tear, tab_edges) = tabs_ui(ui, panels, active, strip, id);
+                // A lone panel has nothing but its name there, which drags the window like the rest.
+                if panels.len() > 1 {
+                    caption_left = tab_edges.last().copied().unwrap_or(menu.right()) - rect.left();
+                }
+                if let Some(torn) = tear {
+                    self.start_panel_drag(ui, host, torn, rect);
+                }
+                if window.id == MAIN_WINDOW {
+                    self.dock_targets.push(DockTarget { panels: panels.to_vec(), rect, tab_edges });
+                }
+                if let Some(&panel) = panels.get(*active).or(panels.first()) {
+                    changed = self.panel_ui(ui, panel, below);
+                }
+            }
+            Node::Split { .. } => {
+                ui.painter().text(
+                    bar.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Percepta",
+                    egui::FontId::proportional(TITLE_FONT_SIZE),
+                    TITLE_TEXT,
+                );
+                if !self.dragging_splitter && !grown {
+                    window.node.fit(below.width(), below.height());
+                }
+                let mut grow = egui::Vec2::ZERO;
+                self.node_ui(ui, &mut window.node, below, id.with("dock"), &mut changed, &mut grow, host);
+                if grow.x > 0.0 || grow.y > 0.0 {
+                    let width = window.node.total(Axis::Horizontal).unwrap_or(below.width() + grow.x);
+                    let height = window.node.total(Axis::Vertical).unwrap_or(below.height() + grow.y);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, TITLE_BAR_HEIGHT + height)));
+                }
+            }
+        }
         if changed {
             self.color_edited();
         }
-        if grow.x > 0.0 || grow.y > 0.0 {
-            let width = dock.total(Axis::Horizontal).unwrap_or(area.width() + grow.x);
-            let height = dock.total(Axis::Vertical).unwrap_or(area.height() + grow.y);
-            let size = egui::vec2(width, TITLE_BAR_HEIGHT + height);
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        frame::set_caption_left(hwnd as _, caption_left);
+        let close = egui::Rect::from_min_max(egui::pos2(bar.right() - TITLE_BUTTON_WIDTH, bar.top()), bar.max);
+        if window.close_icon.show_in(ui, close, id.with("close")) {
+            self.closing.push(window.id);
         }
-        self.dock = dock;
+        window_edge(ui);
     }
 
     fn node_ui(
@@ -875,12 +1113,12 @@ impl App {
         id: egui::Id,
         changed: &mut bool,
         grow: &mut egui::Vec2,
-        source: Option<u64>,
+        host: Host,
     ) {
         let (axis, children) = match node {
             Node::Split { axis, children } => (*axis, children),
             Node::Tabs { panels, active } => {
-                self.stack_ui(ui, panels, active, rect, id, changed, source);
+                self.stack_ui(ui, panels, active, rect, id, changed, host);
                 return;
             }
         };
@@ -889,7 +1127,7 @@ impl App {
             let before: f32 = children[..index].iter().map(|child| child.size).sum();
             let child_rect = span(rect, axis, start + before, start + before + children[index].size);
             let grown_before = *grow;
-            self.node_ui(ui, &mut children[index].node, child_rect, id.with(index), changed, grow, source);
+            self.node_ui(ui, &mut children[index].node, child_rect, id.with(index), changed, grow, host);
             // A nested split that had the window grow has made this child bigger too.
             children[index].size += along((*grow - grown_before).to_pos2(), axis);
             if index + 1 < children.len() {
@@ -904,7 +1142,7 @@ impl App {
         }
     }
 
-    /// A panel or a stack of tabs under its title strip, in the main window.
+    /// A panel or a stack of tabs under its title strip, among others in a window.
     fn stack_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -913,7 +1151,7 @@ impl App {
         rect: egui::Rect,
         id: egui::Id,
         changed: &mut bool,
-        source: Option<u64>,
+        host: Host,
     ) {
         let strip = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), MODULE_TITLE_HEIGHT));
         let content = egui::Rect::from_min_max(egui::pos2(rect.left(), strip.bottom()), rect.max);
@@ -922,9 +1160,9 @@ impl App {
         let (tear, tab_edges) = tabs_ui(ui, panels, active, strip, id);
         let tear = tear.or_else(|| dragged_far_enough(ui, &background).then(|| panels.to_vec()));
         if let Some(panels) = tear {
-            self.start_panel_drag(ui, source, self.main_hwnd(), panels, rect);
+            self.start_panel_drag(ui, host, panels, rect);
         }
-        if source.is_none() {
+        if host.id == MAIN_WINDOW {
             self.dock_targets.push(DockTarget { panels: panels.to_vec(), rect, tab_edges });
         }
         if let Some(&panel) = panels.get(*active).or(panels.first()) {
@@ -932,28 +1170,28 @@ impl App {
         }
     }
 
-    fn start_panel_drag(&mut self, ui: &egui::Ui, source: Option<u64>, hwnd: isize, panels: Vec<Panel>, rect: egui::Rect) {
+    fn start_panel_drag(&mut self, ui: &egui::Ui, host: Host, panels: Vec<Panel>, rect: egui::Rect) {
         if self.dragging.is_some() {
             return;
         }
         let Some(pointer) = ui.ctx().input(|input| input.pointer.press_origin()) else { return };
         let scale = ui.ctx().pixels_per_point();
         let grab = (pointer - rect.min) * scale;
-        let [x, y] = frame::window_origin(hwnd as _);
+        let [x, y] = frame::window_origin(host.hwnd as _);
         self.ghost.show(RECT {
             left: x + (rect.left() * scale) as i32,
             top: y + (rect.top() * scale) as i32,
             right: x + (rect.right() * scale) as i32,
             bottom: y + (rect.bottom() * scale) as i32,
         });
-        self.dragging = Some(PanelDrag { source, panels, size: rect.size(), grab: [grab.x as i32, grab.y as i32] });
+        self.dragging = Some(PanelDrag { source: host.id, panels, size: rect.size(), grab: [grab.x as i32, grab.y as i32] });
         ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
     }
 
     /// Keeps the ghost under the cursor, and when the pen lifts, does what was asked.
     fn sync_panel_drag(&mut self, ctx: &egui::Context) {
         if let Some(id) = self.ghost_until {
-            let window = self.floating.iter().find(|window| window.id == id);
+            let window = self.windows.iter().find(|window| window.id == id);
             if window.is_none_or(|window| window.hwnd.is_some()) {
                 self.ghost.hide();
                 self.ghost_until = None;
@@ -972,12 +1210,9 @@ impl App {
         let Some(drag) = self.dragging.take() else { return };
         let spot = self.drop_at_cursor(&drag);
         let over_main = self.cursor_over_main();
-        let node = match drag.source {
-            None => Some(&mut self.dock),
-            Some(id) => self.floating.iter_mut().find(|window| window.id == id).map(|window| &mut window.node),
-        };
+        let source = self.windows.iter_mut().find(|window| window.id == drag.source);
         // A window has to keep something.
-        let Some(node) = node.filter(|node| node.panels().len() > drag.panels.len()) else {
+        let Some(source) = source.filter(|window| window.node.panels().len() > drag.panels.len()) else {
             self.ghost.hide();
             return;
         };
@@ -985,30 +1220,58 @@ impl App {
             self.ghost.hide();
             return;
         }
+        // A whole module leaves the room it took behind, unlike one tab of several.
+        let whole = drag.panels.first().is_some_and(|&panel| source.node.stack_len(panel) == drag.panels.len());
+        let title = PanelWindow::title_height(&source.node);
+        let split = if let Node::Split { axis, .. } = source.node { Some(axis) } else { None };
         for &panel in &drag.panels {
-            node.remove(panel);
+            source.node.remove(panel);
         }
         if let Some((target, drop, _)) = spot {
-            self.dock.dock(target, drop, drag.panels);
+            // Moving within a window, that room is for where it lands.
+            self.dock_in_main(target, drop, drag.panels, drag.size, whole && drag.source == MAIN_WINDOW);
             self.ghost.hide();
+            ctx.request_repaint();
             return;
+        }
+        if let Some(axis) = split.filter(|_| whole) {
+            let length = along(drag.size.to_pos2(), axis);
+            source.node.shrink_last(length);
+            let by = length + title - PanelWindow::title_height(&source.node);
+            source.shrink(axis, by);
         }
         let id = self.next_window_id;
         self.next_window_id += 1;
-        self.floating.push(FloatingWindow {
-            id,
-            node: Node::tabs(drag.panels),
-            hwnd: None,
-            position,
-            size: drag.size,
-            close_icon: IconButton::new(CLOSE_ICON),
-        });
+        let mut window = PanelWindow::new(id, Node::tabs(drag.panels), self.windows[0].scale);
+        window.position = Some(position);
+        window.first_size = drag.size;
+        self.windows.push(window);
         self.ghost_until = Some(id);
         ctx.request_repaint();
     }
 
+    /// Beside the others, a module keeps its length and the window grows to make room for it,
+    /// as nothing else should have to give way. `size` is the area it fills now.
+    fn dock_in_main(&mut self, target: Panel, drop: DockDrop, panels: Vec<Panel>, size: egui::Vec2, moved_within: bool) {
+        let main = &mut self.windows[0];
+        let DockDrop::Side { axis, before } = drop else {
+            main.node.dock(target, drop, panels);
+            return;
+        };
+        let title = PanelWindow::title_height(&main.node);
+        let length = along(size.to_pos2(), axis).max(Node::tabs(panels.clone()).min_size(axis));
+        let own = along(main.inner.to_pos2(), axis) - title;
+        if moved_within {
+            main.node.shrink_last(length);
+            main.node.dock_sized(target, axis, before, panels, length, own - length);
+        } else if main.node.dock_sized(target, axis, before, panels, length, own) {
+            main.grow(axis, length + PanelWindow::title_height(&main.node) - title);
+        }
+    }
+
     fn cursor_over_main(&self) -> bool {
-        let Some((position, size)) = self.window.as_ref().and_then(PaletteWindow::placement) else { return false };
+        let main = &self.windows[0];
+        let (Some(position), Some(size), true) = (main.position, main.size, main.open) else { return false };
         let [x, y] = platform::cursor_position();
         (position[0]..position[0] + size[0]).contains(&x) && (position[1]..position[1] + size[1]).contains(&y)
     }
@@ -1019,17 +1282,18 @@ impl App {
     /// a module. The target is a panel that stays where it is after the drag, so a stack can't
     /// land on itself.
     fn drop_at_cursor(&self, drag: &PanelDrag) -> Option<(Panel, DockDrop, egui::Rect)> {
-        if platform::is_cloaked() || !self.cursor_over_main() {
+        if !self.cursor_over_main() {
             return None;
         }
-        let (position, _) = self.window.as_ref()?.placement()?;
+        let main = &self.windows[0];
+        let position = main.position?;
         let [x, y] = platform::cursor_position();
-        let point = egui::pos2((x - position[0]) as f32, (y - position[1]) as f32) / self.main_scale;
+        let point = egui::pos2((x - position[0]) as f32, (y - position[1]) as f32) / main.scale;
         // The title bar above the first module counts as the top of that module.
         let target = self.dock_targets.iter().find(|target| target.rect.contains(point)).or_else(|| {
             self.dock_targets.first().filter(|first| point.y < first.rect.top())
         })?;
-        let moving = |panel: &&Panel| drag.source.is_none() && drag.panels.contains(panel);
+        let moving = |panel: &&Panel| drag.source == MAIN_WINDOW && drag.panels.contains(panel);
         let &panel = target.panels.iter().find(|panel| !moving(panel))?;
         let rect = target.rect;
         let strip_bottom = rect.top() + MODULE_TITLE_HEIGHT;
@@ -1056,24 +1320,25 @@ impl App {
     }
 
     /// Windows take their own title bar drags, and say when one has ended.
-    fn sync_moved_windows(&mut self) {
+    fn sync_moved_windows(&mut self, ctx: &egui::Context) {
         let hwnd = frame::take_move_end();
-        let Some(index) = self.floating.iter().position(|window| window.hwnd == Some(hwnd)) else { return };
-        let window = &self.floating[index];
+        let Some(index) = self.windows.iter().position(|window| window.id != MAIN_WINDOW && window.hwnd == Some(hwnd)) else { return };
+        let window = &self.windows[index];
         let panels = window.node.panels();
-        let drag = PanelDrag { source: Some(window.id), panels, size: egui::Vec2::ZERO, grab: [0, 0] };
+        let drag = PanelDrag { source: window.id, panels, size: window.inner, grab: [0, 0] };
         if let Some((target, drop, _)) = self.drop_at_cursor(&drag) {
-            self.floating.remove(index);
-            self.dock.dock(target, drop, drag.panels);
+            self.windows.remove(index);
+            self.dock_in_main(target, drop, drag.panels, drag.size, false);
+            ctx.request_repaint();
         }
     }
 
     /// While something is being dragged, shows where it would land.
     fn sync_drop_indicator(&mut self, ctx: &egui::Context) {
         let moving = frame::moving_window();
-        let floating = self.floating.iter().find(|window| window.hwnd == Some(moving));
+        let floating = self.windows.iter().find(|window| window.id != MAIN_WINDOW && window.hwnd == Some(moving));
         let moved = floating.map(|window| PanelDrag {
-            source: Some(window.id),
+            source: window.id,
             panels: window.node.panels(),
             size: egui::Vec2::ZERO,
             grab: [0, 0],
@@ -1084,12 +1349,12 @@ impl App {
         };
         ctx.request_repaint();
         let spot = self.drop_at_cursor(drag);
-        let placement = self.window.as_ref().and_then(PaletteWindow::placement);
-        let (Some((_, _, rect)), Some((position, size))) = (spot, placement) else {
+        let main = &self.windows[0];
+        let (Some((_, _, rect)), Some(position), Some(size)) = (spot, main.position, main.size) else {
             self.drop_indicator.hide();
             return;
         };
-        let scale = self.main_scale;
+        let scale = main.scale;
         let pixels = |value: f32| (value * scale).round() as i32;
         // A line along one axis is kept whole at the window's edge.
         let line = |at: f32, length: i32| {
@@ -1115,30 +1380,13 @@ impl App {
         );
     }
 
-    fn floating_windows(&mut self, ctx: &egui::Context) {
-        let mut windows = std::mem::take(&mut self.floating);
-        for window in &mut windows {
-            self.floating_window(ctx, window);
-        }
-        self.floating = windows;
-        for id in std::mem::take(&mut self.docking_back) {
-            if let Some(index) = self.floating.iter().position(|window| window.id == id) {
-                let window = self.floating.remove(index);
-                if let Some(&last) = self.dock.panels().last() {
-                    let drop = DockDrop::Side { axis: Axis::Vertical, before: false };
-                    self.dock.dock(last, drop, window.node.panels());
-                }
-            }
-        }
-    }
-
-    fn floating_window(&mut self, ctx: &egui::Context, window: &mut FloatingWindow) {
+    fn floating_window(&mut self, ctx: &egui::Context, window: &mut PanelWindow) {
         let title = window.title();
-        let min_size = [window.node.min_size(Axis::Horizontal), window.node.min_size(Axis::Vertical)];
         let builder = egui::ViewportBuilder::default()
             .with_title(title.clone())
-            .with_inner_size(window.size)
-            .with_min_inner_size(min_size)
+            // A window back from a saved layout has only its outer size on record, for later.
+            .with_inner_size(window.first_size.max(window.min_inner()))
+            .with_min_inner_size(window.min_inner())
             .with_decorations(false)
             .with_maximize_button(false)
             .with_taskbar(false)
@@ -1151,7 +1399,9 @@ impl App {
                 let hwnd = platform::find_own_window(&title)?;
                 platform::guard_window(hwnd, true);
                 frame::install(hwnd, true, platform::palette_shadow_allowed);
-                platform::move_window(hwnd, window.position);
+                if let Some(position) = window.position {
+                    platform::restore_placement(hwnd, position, window.size);
+                }
                 platform::raise_new_window(hwnd);
                 window.hwnd = Some(hwnd as isize);
                 ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -1163,40 +1413,12 @@ impl App {
             self.sync_csp_restore(&ctx);
             let frame = egui::Frame::central_panel(ui.style()).inner_margin(0.0);
             egui::CentralPanel::default().frame(frame).show(ui, |ui| {
-                let closed = self.floating_contents_ui(ui, window, hwnd);
-                window_edge(ui);
-                if closed || ui.input(|input| input.viewport().close_requested()) {
-                    self.docking_back.push(window.id);
+                self.window_ui(ui, window, hwnd);
+                if ui.input(|input| input.viewport().close_requested()) {
+                    self.closing.push(window.id);
                 }
             });
         });
-    }
-
-    /// The title strip here is also the window's title bar. Returns whether it was closed.
-    fn floating_contents_ui(&mut self, ui: &mut egui::Ui, window: &mut FloatingWindow, hwnd: isize) -> bool {
-        let rect = ui.max_rect();
-        let id = ui.scope_id().with("floating");
-        let strip = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), MODULE_TITLE_HEIGHT));
-        let content = egui::Rect::from_min_max(egui::pos2(rect.left(), strip.bottom()), rect.max);
-        ui.painter().rect_filled(strip, 0.0, TITLE_BAR_FILL);
-        let Node::Tabs { panels, active } = &mut window.node else { return false };
-        let (tear, tab_edges) = tabs_ui(ui, panels, active, strip, id);
-        // A lone panel has nothing but its name there, which drags the window like the rest.
-        let tabs_end = tab_edges.last().copied().unwrap_or(rect.left());
-        let caption_left = if panels.len() > 1 { tabs_end - rect.left() } else { 0.0 };
-        frame::set_caption_left(hwnd as _, caption_left);
-        if let Some(torn) = tear {
-            self.start_panel_drag(ui, Some(window.id), hwnd, torn, rect);
-        }
-        let close = egui::Rect::from_min_max(egui::pos2(strip.right() - TITLE_BUTTON_WIDTH, strip.top()), strip.max);
-        let closed = window.close_icon.show_in(ui, close, id.with("close"));
-        let panel = panels.get(*active).or(panels.first()).copied();
-        if let Some(panel) = panel {
-            if self.panel_ui(ui, panel, content) {
-                self.color_edited();
-            }
-        }
-        closed
     }
 
     /// Returns whether the colour was changed.
@@ -1421,13 +1643,14 @@ impl App {
             .on_hover_text("修复用笔操作取色器后，数位板按键映射错误和笔刷光标卡住的问题");
         ui.separator();
 
-        ui.label(RichText::new("关闭按钮").strong());
-        let mut action = self.settings.close_action;
-        ui.horizontal_wrapped(|ui| {
-            ui.radio_value(&mut action, Some(CloseAction::MinimizeToTray), "最小化到托盘");
-            ui.radio_value(&mut action, Some(CloseAction::Quit), "直接退出");
-        });
-        self.settings.close_action = action;
+        ui.label(RichText::new("窗口").strong());
+        for panel in PANELS {
+            let open = self.windows.iter().filter(|window| window.open);
+            let mut shown = open.flat_map(|window| window.node.panels()).any(|other| other == panel);
+            if switch(ui, &mut shown, panel_name(panel)).changed() {
+                self.toggling.push(panel);
+            }
+        }
         ui.separator();
 
         ui.label(RichText::new("CMYK").strong());
@@ -1594,6 +1817,7 @@ impl App {
     }
 
     fn stats_ui(&self, ui: &mut egui::Ui) {
+        ui.ctx().request_repaint_after(STATS_REFRESH);
         ui.label(format!(
             "回读 {} 次/秒 · 平均 {:.1} ms · 最慢 {:.1} ms",
             self.reads_per_second, self.read_ms, self.read_max_ms
@@ -1627,44 +1851,42 @@ impl eframe::App for App {
         self.poll_events();
         self.poll_scan(&ctx);
         self.sync_keyboard(&ctx, self.main_hwnd(), false);
+        self.sync_placements();
+        // Before the click on CSP, which takes the cursor away for a moment.
+        self.sync_panel_drag(&ctx);
+        self.sync_moved_windows(&ctx);
         self.sync_csp_restore(&ctx);
         self.sync_saved_state(&ctx);
-        self.sync_panel_drag(&ctx);
-        self.sync_moved_windows();
         self.updater.poll();
-        self.poll_tray(&ctx);
         if matches!(self.updater.state, update::State::Installing) && !self.quitting {
             self.quit(&ctx);
         }
         if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.close_requested(&ctx);
+            self.closing.push(MAIN_WINDOW);
         }
-
-        let frame = egui::Frame::central_panel(ui.style()).inner_margin(0.0);
-        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
-            if title_bar(ui, "Percepta", &mut self.close_icon) {
-                self.close_requested(&ctx);
-            }
-            let area = ui.available_rect_before_wrap();
-            let mut panels = ui.new_child(egui::UiBuilder::new().max_rect(area));
-            self.panels_ui(&mut panels);
-            window_edge(ui);
-        });
         self.sync_drop_indicator(&ctx);
-        self.floating_windows(&ctx);
 
-        if self.close_dialog_open {
-            self.close_dialog_ui(&ctx, ui);
+        let mut windows = std::mem::take(&mut self.windows);
+        let frame = egui::Frame::central_panel(ui.style()).inner_margin(0.0);
+        let hwnd = self.main_hwnd();
+        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            self.window_ui(ui, &mut windows[0], hwnd);
+        });
+        for window in windows.iter_mut().skip(1).filter(|window| window.open) {
+            self.floating_window(&ctx, window);
         }
+        self.windows = windows;
+
         if self.settings_open {
             self.settings_window(&ctx);
         }
+        self.apply_window_changes(&ctx);
     }
 }
 
-/// Paints the title bar and reports a click on its close button. Windows does the
-/// dragging, in `frame`, which leaves that button's corner to the UI.
+/// Paints the settings window's title bar and reports a click on its close button. Windows does
+/// the dragging, in `frame`, which leaves that button's corner to the UI.
 fn title_bar(ui: &mut egui::Ui, title: &str, close_icon: &mut IconButton) -> bool {
     let (bar, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), TITLE_BAR_HEIGHT),
@@ -1750,10 +1972,18 @@ fn window_edge(ui: &egui::Ui) {
 }
 
 /// What the saved layout says about the panels, or failing that, the default arrangement.
-fn saved_dock(layout: &SavedLayout) -> Node {
+fn saved_windows(layout: &SavedLayout) -> (Node, Vec<SavedWindow>, Vec<HiddenPanel>) {
     // Those heights had no title strips.
     let upgraded = layout.panels.map(|heights| Node::stack(heights.map(|height| height as f32 + MODULE_TITLE_HEIGHT)));
-    layout.dock.clone().or(upgraded).filter(Node::is_complete).unwrap_or_default()
+    let dock = layout.dock.clone().or(upgraded).unwrap_or_default();
+    let mut nodes = vec![&dock];
+    nodes.extend(layout.floating.iter().map(|window| &window.node));
+    let hidden: Vec<Panel> = layout.hidden.iter().map(|hidden| hidden.panel).collect();
+    if layout::is_complete(&nodes, &hidden) {
+        (dock, layout.floating.clone(), layout.hidden.clone())
+    } else {
+        (Node::default(), Vec::new(), Vec::new())
+    }
 }
 
 fn along(point: egui::Pos2, axis: Axis) -> f32 {
@@ -1874,21 +2104,41 @@ mod tests {
             slider,
             dock: None,
             panels: Some([80, 300, 170]),
+            main_open: true,
+            floating: Vec::new(),
+            hidden: Vec::new(),
             settings_offset: None,
             settings_size: None,
         };
-        assert_eq!(saved_dock(&layout), Node::stack([100.0, 320.0, 190.0]));
+        assert_eq!(saved_windows(&layout).0, Node::stack([100.0, 320.0, 190.0]));
 
         layout.dock = Some(Node::stack([90.0, 310.0, 180.0]));
-        assert_eq!(saved_dock(&layout), Node::stack([90.0, 310.0, 180.0]));
+        assert_eq!(saved_windows(&layout).0, Node::stack([90.0, 310.0, 180.0]));
 
-        layout.dock = Some(Node::Tabs { panels: vec![Panel::Wheel], active: 0 });
-        assert_eq!(saved_dock(&layout), Node::default());
-    }
+        layout.dock = Some(Node::tabs(vec![Panel::Wheel]));
+        assert_eq!(saved_windows(&layout).0, Node::default());
 
-    #[test]
-    fn the_smallest_window_fits_the_minimum_panels_under_the_title_bar() {
-        assert_eq!(MIN_WINDOW_HEIGHT, 490.0);
+        // The rest may be in other windows or hidden, as long as nothing is missing.
+        layout.floating.push(SavedWindow {
+            id: 1,
+            node: Node::tabs(vec![Panel::Sliders]),
+            open: false,
+            position: None,
+            size: None,
+        });
+        layout.hidden.push(HiddenPanel {
+            panel: Panel::Slots,
+            window: MAIN_WINDOW,
+            home: Home { beside: Panel::Wheel, drop: DockDrop::Tab(0), size: None },
+        });
+        let (dock, floating, hidden) = saved_windows(&layout);
+        assert_eq!(dock, Node::tabs(vec![Panel::Wheel]));
+        assert_eq!((floating.len(), hidden.len()), (1, 1));
+
+        layout.hidden[0].panel = Panel::Wheel;
+        let (dock, floating, hidden) = saved_windows(&layout);
+        assert_eq!(dock, Node::default());
+        assert!(floating.is_empty() && hidden.is_empty());
     }
 
     #[test]

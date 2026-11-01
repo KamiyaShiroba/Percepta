@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::color::Model;
 use crate::csp::auth::Pairing;
 use crate::csp::{Rgb, Slot};
-use crate::layout::Node;
+use crate::layout::{Home, Node, Panel};
 use crate::picker::SliderTab;
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -30,12 +30,41 @@ pub struct SavedLayout {
     /// sliders, at 100% scale.
     #[serde(default, skip_serializing)]
     pub panels: Option<[i32; 3]>,
+    /// Whether the window that these first fields describe is open.
+    #[serde(default = "always")]
+    pub main_open: bool,
+    #[serde(default)]
+    pub floating: Vec<SavedWindow>,
+    #[serde(default)]
+    pub hidden: Vec<HiddenPanel>,
     /// Where the settings window was relative to this one, in physical pixels.
     #[serde(default)]
     pub settings_offset: Option<[i32; 2]>,
     /// The settings window's outer size, in physical pixels.
     #[serde(default)]
     pub settings_size: Option<[i32; 2]>,
+}
+
+fn always() -> bool {
+    true
+}
+
+/// A window other than the first, open or not.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct SavedWindow {
+    pub id: u64,
+    pub node: Node,
+    pub open: bool,
+    pub position: Option<[i32; 2]>,
+    pub size: Option<[i32; 2]>,
+}
+
+/// A panel taken out of a window on its own, which still has a place to go back to.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub struct HiddenPanel {
+    pub panel: Panel,
+    pub window: u64,
+    pub home: Home,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -51,19 +80,11 @@ pub struct SavedColors {
 pub struct SavedSettings {
     pub restore_csp: bool,
     pub check_updates: bool,
-    /// `None` until the user has been asked, the first time they close the window.
-    pub close_action: Option<CloseAction>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub enum CloseAction {
-    MinimizeToTray,
-    Quit,
 }
 
 impl Default for SavedSettings {
     fn default() -> Self {
-        Self { restore_csp: true, check_updates: true, close_action: None }
+        Self { restore_csp: true, check_updates: true }
     }
 }
 
@@ -145,6 +166,40 @@ mod tests {
         let layout: SavedLayout = serde_json::from_str(old).unwrap();
         assert_eq!(layout.position, Some([76, 76]));
         assert_eq!(layout.size, None);
+        assert!(layout.main_open);
+        assert!(layout.floating.is_empty());
+    }
+
+    #[test]
+    fn settings_saved_with_the_old_close_action_still_load() {
+        let old = r#"{"restore_csp":false,"check_updates":true,"close_action":"Quit"}"#;
+        let settings: SavedSettings = serde_json::from_str(old).unwrap();
+        assert!(!settings.restore_csp);
+    }
+
+    #[test]
+    fn windows_and_hidden_panels_survive_saving() {
+        let old = r#"{"position":[1,2],"wheel":"Hsv","slider":{"Color":"Hsv"}}"#;
+        let mut layout: SavedLayout = serde_json::from_str(old).unwrap();
+        layout.main_open = false;
+        layout.floating.push(SavedWindow {
+            id: 4,
+            node: Node::tabs(vec![Panel::Wheel]),
+            open: true,
+            position: Some([5, 6]),
+            size: Some([7, 8]),
+        });
+        layout.hidden.push(HiddenPanel {
+            panel: Panel::Slots,
+            window: 0,
+            home: Home {
+                beside: Panel::Sliders,
+                drop: crate::layout::Drop::Side { axis: crate::layout::Axis::Vertical, before: true },
+                size: Some(92.0),
+            },
+        });
+        let again: SavedLayout = serde_json::from_str(&serde_json::to_string(&layout).unwrap()).unwrap();
+        assert_eq!(again, layout);
     }
 
     #[test]

@@ -2,11 +2,12 @@
 //! a second start and the installer both find it by its window class.
 
 use std::ptr;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
 use std::sync::OnceLock;
 
 use eframe::egui;
 use windows_sys::core::{w, PCWSTR};
+use crate::layout::{Panel, PANELS};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
@@ -15,7 +16,7 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, FindWindowW,
     GetCursorPos, GetForegroundWindow, PostMessageW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
-    TrackPopupMenu, HICON, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_LBUTTONDBLCLK,
+    TrackPopupMenu, HICON, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_LBUTTONDBLCLK,
     WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_POPUP,
 };
 
@@ -25,26 +26,38 @@ const TRAY_MESSAGE: u32 = WM_APP + 1;
 /// installer/percepta.iss sends this number to make the running app exit.
 const QUIT_MESSAGE: u32 = WM_APP + 2;
 const SHOW_MESSAGE: u32 = WM_APP + 3;
+/// A window's own menu button, with where to open in `wparam` and `lparam`.
+const WINDOW_MENU_MESSAGE: u32 = WM_APP + 4;
 const ICON_ID: u32 = 1;
 const ICON_SIZE: i32 = 32;
 const MENU_SHOW: usize = 1;
 const MENU_SETTINGS: usize = 2;
 const MENU_QUIT: usize = 3;
+/// Followed by the other panels, in the order of `PANELS`.
+const MENU_FIRST_PANEL: usize = 4;
 
 const REQUEST_NONE: u8 = 0;
 const REQUEST_SHOW: u8 = 1;
 const REQUEST_SETTINGS: u8 = 2;
 const REQUEST_QUIT: u8 = 3;
+/// Followed by the other panels, in the order of `PANELS`.
+const REQUEST_FIRST_PANEL: u8 = 4;
 
 /// The last thing asked for through the tray, until the UI picks it up.
 static REQUEST: AtomicU8 = AtomicU8::new(REQUEST_NONE);
 static CONTEXT: OnceLock<egui::Context> = OnceLock::new();
+static TRAY_WINDOW: AtomicIsize = AtomicIsize::new(0);
+/// One bit for each panel on screen, in the order of `PANELS`, for the menu's check marks.
+static SHOWN_PANELS: AtomicU8 = AtomicU8::new(0);
+/// Set when a menu opened from a window has closed, until the UI has taken note.
+static WINDOW_MENU_ENDED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
     Show,
     Settings,
     Quit,
+    TogglePanel(Panel),
 }
 
 /// Returns what the user asked for since the last call.
@@ -53,7 +66,7 @@ pub fn take_request() -> Option<Request> {
         REQUEST_SHOW => Some(Request::Show),
         REQUEST_SETTINGS => Some(Request::Settings),
         REQUEST_QUIT => Some(Request::Quit),
-        _ => None,
+        value => PANELS.get((value as usize).wrapping_sub(REQUEST_FIRST_PANEL as usize)).copied().map(Request::TogglePanel),
     }
 }
 
@@ -62,6 +75,26 @@ fn request(value: u8) {
     if let Some(ctx) = CONTEXT.get() {
         ctx.request_repaint();
     }
+}
+
+/// Says which panels are on screen, for the next time the menu opens.
+pub fn set_shown_panels(shown: impl Fn(Panel) -> bool) {
+    let bits = PANELS.iter().enumerate().filter(|(_, &panel)| shown(panel)).fold(0, |bits, (index, _)| bits | 1 << index);
+    SHOWN_PANELS.store(bits, Ordering::Relaxed);
+}
+
+/// Opens the same menu as the tray's, from a window's own button, with its corner at this
+/// point in physical pixels. Not right here: the menu runs its own message loop, which
+/// belongs outside of the frame being drawn.
+pub fn open_menu([x, y]: [i32; 2]) {
+    let hwnd = TRAY_WINDOW.load(Ordering::Relaxed) as HWND;
+    // SAFETY: takes no pointers, and a missing window only makes it fail.
+    unsafe { PostMessageW(hwnd, WINDOW_MENU_MESSAGE, x as isize as WPARAM, y as LPARAM) };
+}
+
+/// Whether a menu opened from a window has closed since the last call.
+pub fn take_menu_end() -> bool {
+    WINDOW_MENU_ENDED.swap(false, Ordering::Relaxed)
 }
 
 /// If Percepta is already running, brings it up and returns true.
@@ -114,6 +147,7 @@ impl Tray {
         if hwnd.is_null() {
             return None;
         }
+        TRAY_WINDOW.store(hwnd as isize, Ordering::Relaxed);
         let icon = crate::platform::create_icon(&pixels(ICON_SIZE as usize), ICON_SIZE);
         ICON.store(icon as usize, Ordering::Relaxed);
         add_icon(hwnd, icon);
@@ -156,25 +190,34 @@ fn add_icon(hwnd: HWND, icon: HICON) {
     unsafe { Shell_NotifyIconW(NIM_ADD, &data) };
 }
 
-fn show_menu(hwnd: HWND) {
+/// Opens the menu at the cursor, or at `at` for a window's own button.
+fn show_menu(hwnd: HWND, at: Option<POINT>) {
     // Tray menus only close properly when clicking away if their window is in front, and
     // that must be undone afterwards or CSP would lose the keyboard.
     // SAFETY: plain Win32 calls on a menu made here and destroyed before returning.
     unsafe {
         let previous = GetForegroundWindow();
         let menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, MENU_SHOW, w!("显示窗口"));
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w!("窗口"));
+        let shown = SHOWN_PANELS.load(Ordering::Relaxed);
+        for (index, name) in [w!("颜色"), w!("色环"), w!("滑块")].into_iter().enumerate() {
+            let check = if shown & 1 << index != 0 { MF_CHECKED } else { 0 };
+            AppendMenuW(menu, MF_STRING | check, MENU_FIRST_PANEL + index, name);
+        }
+        AppendMenuW(menu, MF_STRING, MENU_SHOW, w!("显示全部"));
+        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
         AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("设置"));
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
         AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("退出 Percepta"));
         let mut cursor = POINT { x: 0, y: 0 };
         GetCursorPos(&mut cursor);
+        let point = at.unwrap_or(cursor);
         SetForegroundWindow(hwnd);
         let chosen = TrackPopupMenu(
             menu,
             TPM_RETURNCMD | TPM_RIGHTBUTTON,
-            cursor.x,
-            cursor.y,
+            point.x,
+            point.y,
             0,
             hwnd,
             ptr::null(),
@@ -184,11 +227,15 @@ fn show_menu(hwnd: HWND) {
         if !previous.is_null() {
             SetForegroundWindow(previous);
         }
+        if at.is_some() {
+            WINDOW_MENU_ENDED.store(true, Ordering::Relaxed);
+        }
         match chosen {
+            0 => request(REQUEST_NONE),
             MENU_SHOW => request(REQUEST_SHOW),
             MENU_SETTINGS => request(REQUEST_SETTINGS),
             MENU_QUIT => request(REQUEST_QUIT),
-            _ => {}
+            panel => request(REQUEST_FIRST_PANEL + (panel - MENU_FIRST_PANEL) as u8),
         }
     }
 }
@@ -200,11 +247,12 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, message: u32, wparam: WPARAM, lp
     match message {
         TRAY_MESSAGE => match lparam as u32 {
             WM_LBUTTONDBLCLK => request(REQUEST_SHOW),
-            WM_RBUTTONUP => show_menu(hwnd),
+            WM_RBUTTONUP => show_menu(hwnd, None),
             _ => {}
         },
         QUIT_MESSAGE => request(REQUEST_QUIT),
         SHOW_MESSAGE => request(REQUEST_SHOW),
+        WINDOW_MENU_MESSAGE => show_menu(hwnd, Some(POINT { x: wparam as i32, y: lparam as i32 })),
         _ if message == taskbar_created => add_icon(hwnd, ICON.load(Ordering::Relaxed) as HICON),
         _ => {}
     }

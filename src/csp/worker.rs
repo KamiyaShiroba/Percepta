@@ -40,6 +40,8 @@ pub enum Event {
     Reconnecting(String),
     /// CSP's slots changed. Unchanged polls emit nothing, so the UI stays idle.
     Slots(CspSlots),
+    /// Comes every second but matters only to the settings window, which looks by itself, so
+    /// this alone doesn't wake the UI and have every window drawn while the user is painting.
     Stats { reads_per_second: u32, read_average: Duration, read_max: Duration },
     Sent { rgb: Rgb, accepted: bool, round_trip: Duration },
     Blocked(bool),
@@ -68,8 +70,11 @@ impl Worker {
         let (commands, inbox) = mpsc::channel();
         thread::spawn(move || {
             let emit = |event| {
+                let wake = !matches!(event, Event::Stats { .. });
                 let _ = events.send(event);
-                wake_ui();
+                if wake {
+                    wake_ui();
+                }
             };
             keep_connected(pairing, reconnect, &inbox, &emit);
         });

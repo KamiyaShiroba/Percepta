@@ -48,8 +48,8 @@ static FOREGROUND_CHANGED: AtomicBool = AtomicBool::new(false);
 /// Alternates the title bar click position so two quick clicks never count as a
 /// double-click, which would maximise CSP.
 static USE_SECOND_SPOT: AtomicBool = AtomicBool::new(false);
-/// Set while the window is hidden in the tray.
-static CLOAKED: AtomicBool = AtomicBool::new(false);
+/// Set while every window that holds panels is closed.
+static ALL_CLOSED: AtomicBool = AtomicBool::new(false);
 
 /// Why there was nothing to restore, as is normal while the user is in another program.
 pub const CSP_NOT_IN_FRONT: &str = "CSP 不在前台";
@@ -58,7 +58,7 @@ const HIT_TEST_TIMEOUT_MS: u32 = 50;
 /// A point this far in from the window's corner lies on its title bar.
 const TITLE_BAR_PROBE: i32 = 20;
 const TOPMOST_CHECK_INTERVAL: Duration = Duration::from_millis(250);
-const TOPMOST_REASSERT_INTERVAL: Duration = Duration::from_secs(3);
+const TOPMOST_REASSERT_INTERVAL: Duration = Duration::from_millis(500);
 /// How long the foreground must stay away from CSP before this window steps back.
 const TOPMOST_LOWER_DELAY: Duration = Duration::from_millis(120);
 const ORDINARY_SETTLE_TIME: Duration = Duration::from_secs(1);
@@ -222,7 +222,6 @@ impl PaletteWindow {
     /// Takes the window off the screen, and the keyboard back from it if it had it.
     pub fn hide(&self) {
         let hwnd = self.hwnd as HWND;
-        CLOAKED.store(true, Ordering::Relaxed);
         frame::set_cloaked(hwnd, true);
         frame::refresh_shadow(hwnd);
         // SAFETY: plain window queries, and stale handles only fail.
@@ -238,26 +237,8 @@ impl PaletteWindow {
 
     /// Puts the window back in front of the normal windows.
     pub fn show(&self) {
-        let hwnd = self.hwnd as HWND;
-        CLOAKED.store(false, Ordering::Relaxed);
-        frame::set_cloaked(hwnd, false);
-        // SAFETY: takes no pointers, and a stale handle only fails. While following CSP
-        // the window can't be activated, and being topmost is all it needs.
-        unsafe {
-            SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            if ORDINARY_WINDOW.load(Ordering::Relaxed) {
-                SetForegroundWindow(hwnd);
-            }
-        }
-    }
-
-    /// The top-left corner and outer size in physical pixels, or `None` while minimized,
-    /// when Windows reports meaningless values.
-    pub fn placement(&self) -> Option<([i32; 2], [i32; 2])> {
-        let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-        // SAFETY: `rect` is valid for writes, and a stale handle only fails.
-        let ok = unsafe { IsIconic(self.hwnd as HWND) == 0 && GetWindowRect(self.hwnd as HWND, &mut rect) != 0 };
-        ok.then_some(([rect.left, rect.top], [rect.right - rect.left, rect.bottom - rect.top]))
+        frame::set_cloaked(self.hwnd as HWND, false);
+        bring_up(self.hwnd as HWND);
     }
 
     /// Gives the settings window its last size, and puts it where it was relative to this
@@ -301,25 +282,6 @@ impl PaletteWindow {
         ))
     }
 
-    /// Puts the window back where it was, unless that would leave its title bar off every
-    /// monitor, as happens when a monitor has been unplugged since it was saved.
-    pub fn restore_placement(&self, [x, y]: [i32; 2], size: Option<[i32; 2]>) {
-        let title_bar = POINT { x: x + TITLE_BAR_PROBE, y: y + TITLE_BAR_PROBE };
-        let hwnd = self.hwnd as HWND;
-        // SAFETY: takes no pointers, and a stale handle only fails.
-        unsafe {
-            if MonitorFromPoint(title_bar, MONITOR_DEFAULTTONULL).is_null() {
-                return;
-            }
-            SetWindowPos(hwnd, ptr::null_mut(), x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            // Separately and afterwards: the move can rescale the window for its monitor,
-            // and the saved size is already in that monitor's pixels.
-            if let Some([width, height]) = size {
-                SetWindowPos(hwnd, ptr::null_mut(), 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-            }
-        }
-    }
-
     /// While the user is in CSP, keeps the window above everything without ever taking
     /// the keyboard. Otherwise it acts like any other window. Runs for as long as the app
     /// does, on its own thread, because this has to work while nothing makes the UI repaint.
@@ -358,7 +320,7 @@ impl PaletteWindow {
                 });
                 // SAFETY: only reads the window's state; a stale handle reads as false.
                 let (shown, minimized) = unsafe { (IsWindowVisible(hwnd) != 0, IsIconic(hwnd) != 0) };
-                if !shown || minimized || is_cloaked() {
+                if !shown || minimized || all_closed() {
                     visible = false;
                     continue;
                 }
@@ -389,11 +351,7 @@ impl PaletteWindow {
                 match topmost_action(want_top, topmost, last_assert.elapsed(), just_shown) {
                     TopmostAction::None => {}
                     TopmostAction::Raise => {
-                        place_window(hwnd, HWND_TOPMOST);
-                        // Above this one, whose place in that band would otherwise cover them.
-                        for other in guarded_windows().iter().filter(|other| other.hwnd != hwnd as isize) {
-                            place_window(other.hwnd as HWND, HWND_TOPMOST);
-                        }
+                        raise_windows(hwnd);
                         topmost = true;
                         last_assert = Instant::now();
                     }
@@ -413,6 +371,14 @@ impl PaletteWindow {
                             }
                         }
                         last_assert = Instant::now();
+                    }
+                }
+                // A window that opens just as the program starts can get there before the mode
+                // has been applied, and none of the above would ever take it back down.
+                if !want_top {
+                    for window in panel_windows().into_iter().filter(|&window| is_topmost(window)) {
+                        place_window(window, HWND_NOTOPMOST);
+                        tuck_under_foreground(window);
                     }
                 }
             }
@@ -477,9 +443,58 @@ pub fn palette_shadow_allowed(hwnd: HWND) -> bool {
     typing || ORDINARY_WINDOW.load(Ordering::Relaxed)
 }
 
-/// Whether the palette window is hidden in the tray.
-pub fn is_cloaked() -> bool {
-    CLOAKED.load(Ordering::Relaxed)
+/// Whether every window that holds panels is closed.
+pub fn all_closed() -> bool {
+    ALL_CLOSED.load(Ordering::Relaxed)
+}
+
+pub fn set_all_closed(closed: bool) {
+    ALL_CLOSED.store(closed, Ordering::Relaxed);
+}
+
+/// Puts a window in front of the normal windows. While following CSP it can't be activated,
+/// and being topmost is all it needs.
+pub fn bring_up(hwnd: HWND) {
+    // SAFETY: takes no pointers, and a stale handle only fails.
+    unsafe {
+        SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        if ORDINARY_WINDOW.load(Ordering::Relaxed) {
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+/// A window's top-left corner and outer size in physical pixels, or `None` while it is
+/// minimized, when Windows reports meaningless values.
+pub fn placement(hwnd: HWND) -> Option<([i32; 2], [i32; 2])> {
+    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    // SAFETY: `rect` is valid for writes, and a stale handle only fails.
+    let ok = unsafe { IsIconic(hwnd) == 0 && GetWindowRect(hwnd, &mut rect) != 0 };
+    ok.then_some(([rect.left, rect.top], [rect.right - rect.left, rect.bottom - rect.top]))
+}
+
+/// Puts a window back where it was, unless that would leave its title bar off every monitor,
+/// as happens when a monitor has been unplugged since it was saved.
+pub fn restore_placement(hwnd: HWND, [x, y]: [i32; 2], size: Option<[i32; 2]>) {
+    let title_bar = POINT { x: x + TITLE_BAR_PROBE, y: y + TITLE_BAR_PROBE };
+    // SAFETY: takes no pointers, and a stale handle only fails.
+    unsafe {
+        if MonitorFromPoint(title_bar, MONITOR_DEFAULTTONULL).is_null() {
+            return;
+        }
+        SetWindowPos(hwnd, ptr::null_mut(), x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    // Separately and afterwards: the move can rescale the window for its monitor,
+    // and the saved size is already in that monitor's pixels.
+    if let Some(size) = size {
+        resize_window(hwnd, size);
+    }
+}
+
+/// Sets a window's outer size without moving, raising or activating it.
+pub fn resize_window(hwnd: HWND, [width, height]: [i32; 2]) {
+    // SAFETY: takes no pointers, and a stale handle only fails.
+    unsafe { SetWindowPos(hwnd, ptr::null_mut(), 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) };
 }
 
 /// The first window below `hwnd` that a user would count as an open window.
@@ -533,8 +548,8 @@ enum TopmostAction {
     Recheck,
 }
 
-/// While wanted, the state is asserted again now and then, because window managers
-/// sometimes drop it without any notice.
+/// While wanted, the state is looked at again now and then, because window managers
+/// sometimes drop it without any notice, and a window can fail to get it in the first place.
 fn topmost_action(want_top: bool, topmost: bool, since_assert: Duration, just_shown: bool) -> TopmostAction {
     match (want_top, topmost) {
         (true, false) => TopmostAction::Raise,
@@ -574,6 +589,31 @@ fn wait_for_foreground_change(timeout: Duration) {
         if FOREGROUND_CHANGED.swap(false, Ordering::Relaxed) || Instant::now() >= deadline {
             return;
         }
+    }
+}
+
+fn is_topmost(hwnd: HWND) -> bool {
+    // SAFETY: a plain window query; a stale handle reads as 0.
+    unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0 }
+}
+
+/// Puts `main` and then the other windows in the topmost band, each above the one before, if
+/// any of them is missing from it. Otherwise it leaves them be: placing them again would make
+/// them change places among themselves every time, which is real work for the whole desktop
+/// and goes on while the user is drawing.
+fn raise_windows(main: HWND) {
+    let others = guarded_windows().into_iter().map(|window| window.hwnd as HWND).filter(|&window| window != main);
+    let windows: Vec<HWND> = std::iter::once(main).chain(others).collect();
+    if windows.iter().all(|&window| is_topmost(window)) {
+        return;
+    }
+    for window in windows {
+        // If its IME window is in the band already, Windows reports success for a window that
+        // is not, and does nothing, until it has been told to leave the band first.
+        if !is_topmost(window) {
+            place_window(window, HWND_NOTOPMOST);
+        }
+        place_window(window, HWND_TOPMOST);
     }
 }
 
@@ -691,12 +731,6 @@ pub fn cursor_position() -> [i32; 2] {
 pub fn raise_new_window(hwnd: HWND) {
     let ordinary = ORDINARY_WINDOW.load(Ordering::Relaxed);
     place_window(hwnd, if ordinary { HWND_TOP } else { HWND_TOPMOST });
-}
-
-/// Moves a window without resizing, raising or activating it.
-pub fn move_window(hwnd: HWND, [x, y]: [i32; 2]) {
-    // SAFETY: takes no pointers, and a stale handle only fails.
-    unsafe { SetWindowPos(hwnd, ptr::null_mut(), x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) };
 }
 
 pub fn pen_or_mouse_down() -> bool {

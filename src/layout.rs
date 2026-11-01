@@ -20,7 +20,7 @@ pub enum Panel {
     Sliders,
 }
 
-const PANELS: [Panel; 3] = [Panel::Slots, Panel::Wheel, Panel::Sliders];
+pub const PANELS: [Panel; 3] = [Panel::Slots, Panel::Wheel, Panel::Sliders];
 
 impl Panel {
     fn min_size(self, axis: Axis) -> f32 {
@@ -40,12 +40,21 @@ pub enum Axis {
 }
 
 /// Where something dropped on a stack of tabs goes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Drop {
     /// Among its tabs, before the one at this index, or after them all if there is none.
     Tab(usize),
     /// Beside it, before it along the axis or after it.
     Side { axis: Axis, before: bool },
+}
+
+/// Where a hidden panel goes back to.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Home {
+    pub beside: Panel,
+    pub drop: Drop,
+    /// Its length, if the window gave that up when it was hidden and takes it back on return.
+    pub size: Option<f32>,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -75,25 +84,6 @@ impl Node {
             size,
         });
         Node::Split { axis: Axis::Vertical, children: children.collect() }
-    }
-
-    /// Whether every panel appears exactly once, which a damaged file can't be trusted to do.
-    pub fn is_complete(&self) -> bool {
-        fn collect(node: &Node, found: &mut Vec<Panel>) -> bool {
-            match node {
-                Node::Tabs { panels, .. } => {
-                    found.extend(panels);
-                    !panels.is_empty()
-                }
-                Node::Split { children, .. } => {
-                    !children.is_empty() && children.iter().all(|child| collect(&child.node, found))
-                }
-            }
-        }
-        let mut found = Vec::new();
-        collect(self, &mut found)
-            && found.len() == PANELS.len()
-            && PANELS.iter().all(|panel| found.contains(panel))
     }
 
     pub fn tabs(panels: Vec<Panel>) -> Self {
@@ -131,6 +121,90 @@ impl Node {
                 if children.len() == 1 {
                     *self = children.remove(0).node;
                 }
+            }
+        }
+    }
+
+    /// Takes a panel out and says where it goes back to, unless it is all the node holds. Beside
+    /// the others in the window's own split, the window is to give up its length.
+    pub fn hide(&mut self, panel: Panel) -> Option<Home> {
+        let home = self.home(panel, true)?;
+        self.remove(panel);
+        if let Some(size) = home.size {
+            self.shrink_last(size);
+        }
+        Some(home)
+    }
+
+    /// Takes back room that `remove` gave to the last child, for when the window is not to
+    /// keep it.
+    pub fn shrink_last(&mut self, by: f32) {
+        if let Node::Split { children, .. } = self {
+            if let Some(last) = children.last_mut() {
+                last.size -= by;
+            }
+        }
+    }
+
+    fn home(&self, panel: Panel, top: bool) -> Option<Home> {
+        match self {
+            Node::Tabs { panels, .. } => {
+                let index = panels.iter().position(|&other| other == panel)?;
+                let beside = *panels.get(index.wrapping_sub(1)).or(panels.get(1))?;
+                (panels.len() > 1).then_some(Home { beside, drop: Drop::Tab(index), size: None })
+            }
+            Node::Split { axis, children } => {
+                let index = children.iter().position(|child| child.node.panels().contains(&panel))?;
+                if children[index].node.panels().len() > 1 {
+                    return children[index].node.home(panel, false);
+                }
+                let size = top.then_some(children[index].size);
+                let side = |before| Drop::Side { axis: *axis, before };
+                let next = children.get(index + 1).and_then(|child| child.node.panels().first().copied());
+                let home = next.map(|beside| Home { beside, drop: side(true), size });
+                home.or_else(|| {
+                    let previous = children.get(index.checked_sub(1)?)?.node.panels().last().copied()?;
+                    Some(Home { beside: previous, drop: side(false), size })
+                })
+            }
+        }
+    }
+
+    /// Puts a hidden panel back. `own` is how long what is here now is along the panel's axis,
+    /// for when it was alone until now and has no length on record.
+    pub fn restore(&mut self, panel: Panel, home: Home, own: f32) {
+        match (home.drop, home.size) {
+            (Drop::Side { axis, before }, Some(size)) => {
+                self.dock_sized(home.beside, axis, before, vec![panel], size, own);
+            }
+            _ => self.dock(home.beside, home.drop, vec![panel]),
+        }
+    }
+
+    /// Puts `panels` beside `target` with a length of their own, taking none from the others,
+    /// and returns whether that worked out. `own` is how long the stack here is if it is alone
+    /// and has no length on record. If the split here runs the other way, they just get their
+    /// share as in `dock`.
+    pub fn dock_sized(&mut self, target: Panel, axis: Axis, before: bool, panels: Vec<Panel>, size: f32, own: f32) -> bool {
+        match self {
+            Node::Split { axis: along, children } if *along == axis => {
+                let Some(index) = children.iter().position(|child| child.node.panels().contains(&target)) else {
+                    return false;
+                };
+                let at = if before { index } else { index + 1 };
+                children.insert(at, Child { node: Node::tabs(panels), size });
+                true
+            }
+            Node::Tabs { .. } => {
+                let this = Child { node: std::mem::take(self), size: own };
+                let new = Child { node: Node::tabs(panels), size };
+                let children = if before { vec![new, this] } else { vec![this, new] };
+                *self = Node::Split { axis, children };
+                true
+            }
+            Node::Split { .. } => {
+                self.dock(target, Drop::Side { axis, before }, panels);
+                false
             }
         }
     }
@@ -182,6 +256,15 @@ impl Node {
         match self {
             Node::Tabs { panels, .. } => panels.contains(&panel).then_some(self),
             Node::Split { children, .. } => children.iter_mut().find_map(|child| child.node.stack_mut(panel)),
+        }
+    }
+
+    /// How many panels share a stack with this one, itself included.
+    pub fn stack_len(&self, panel: Panel) -> usize {
+        match self {
+            Node::Tabs { panels, .. } if panels.contains(&panel) => panels.len(),
+            Node::Tabs { .. } => 0,
+            Node::Split { children, .. } => children.iter().map(|child| child.node.stack_len(panel)).sum(),
         }
     }
 
@@ -250,6 +333,26 @@ impl Node {
             _ => None,
         }
     }
+}
+
+/// Whether every panel appears exactly once among these, which a damaged file can't be trusted
+/// to do.
+pub fn is_complete(nodes: &[&Node], hidden: &[Panel]) -> bool {
+    fn collect(node: &Node, found: &mut Vec<Panel>) -> bool {
+        match node {
+            Node::Tabs { panels, .. } => {
+                found.extend(panels);
+                !panels.is_empty()
+            }
+            Node::Split { children, .. } => {
+                !children.is_empty() && children.iter().all(|child| collect(&child.node, found))
+            }
+        }
+    }
+    let mut found = hidden.to_vec();
+    nodes.iter().all(|node| collect(node, &mut found))
+        && found.len() == PANELS.len()
+        && PANELS.iter().all(|panel| found.contains(panel))
 }
 
 /// Applies dragging the line after `children[line]` by `delta`, along `axis`, and returns by
@@ -338,7 +441,7 @@ mod tests {
         let mut tabbed = node.clone();
         tabbed.dock(Panel::Slots, Drop::Tab(usize::MAX), vec![Panel::Wheel]);
         assert_eq!(tabbed.panels(), [Panel::Slots, Panel::Wheel, Panel::Sliders]);
-        assert!(tabbed.is_complete());
+        assert!(is_complete(&[&tabbed], &[]));
         assert_eq!(heights(&tabbed), [92.0, 588.0]);
 
         let mut above = node.clone();
@@ -400,6 +503,36 @@ mod tests {
     }
 
     #[test]
+    fn a_module_docked_with_its_own_length_leaves_the_others_theirs() {
+        let mut node = Node::stack([92.0, 360.0, 228.0]);
+        node.remove(Panel::Wheel);
+        node.shrink_last(360.0);
+        assert!(node.dock_sized(Panel::Sliders, Axis::Vertical, false, vec![Panel::Wheel], 300.0, 0.0));
+        assert_eq!(heights(&node), [92.0, 228.0, 300.0]);
+        assert_eq!(node.panels(), [Panel::Slots, Panel::Sliders, Panel::Wheel]);
+
+        let mut lone = Node::tabs(vec![Panel::Wheel]);
+        assert!(lone.dock_sized(Panel::Wheel, Axis::Vertical, true, vec![Panel::Slots], 92.0, 360.0));
+        assert_eq!(heights(&lone), [92.0, 360.0]);
+
+        let mut across = nested();
+        assert!(!across.dock_sized(Panel::Slots, Axis::Vertical, true, vec![], 92.0, 0.0));
+    }
+
+    #[test]
+    fn only_the_tabs_of_its_own_stack_count_for_a_panel() {
+        let stacks = Node::Split {
+            axis: Axis::Vertical,
+            children: vec![
+                Child { node: Node::tabs(vec![Panel::Slots, Panel::Wheel]), size: 1.0 },
+                Child { node: Node::tabs(vec![Panel::Sliders]), size: 1.0 },
+            ],
+        };
+        assert_eq!(stacks.stack_len(Panel::Wheel), 2);
+        assert_eq!(stacks.stack_len(Panel::Sliders), 1);
+    }
+
+    #[test]
     fn a_nested_split_fits_itself_and_counts_towards_its_parents_minimums() {
         let mut node = nested();
         assert_eq!(node.min_size(Axis::Horizontal), 480.0);
@@ -419,14 +552,70 @@ mod tests {
     }
 
     #[test]
-    fn a_tree_must_hold_every_panel_exactly_once() {
-        assert!(Node::default().is_complete());
-        assert!(nested().is_complete());
+    fn every_panel_must_appear_exactly_once_among_the_windows() {
+        assert!(is_complete(&[&Node::default()], &[]));
+        assert!(is_complete(&[&nested()], &[]));
         let tabs = |panels: &[Panel]| Node::Tabs { panels: panels.to_vec(), active: 0 };
-        assert!(tabs(&PANELS).is_complete());
-        assert!(!tabs(&[Panel::Wheel, Panel::Wheel, Panel::Slots]).is_complete());
-        assert!(!tabs(&[Panel::Wheel]).is_complete());
-        assert!(!Node::Split { axis: Axis::Vertical, children: Vec::new() }.is_complete());
+        assert!(is_complete(&[&tabs(&PANELS)], &[]));
+        assert!(!is_complete(&[&tabs(&[Panel::Wheel, Panel::Wheel, Panel::Slots])], &[]));
+        assert!(!is_complete(&[&tabs(&[Panel::Wheel])], &[]));
+        assert!(!is_complete(&[&Node::Split { axis: Axis::Vertical, children: Vec::new() }], &[]));
+
+        let (wheel, rest) = (tabs(&[Panel::Wheel]), tabs(&[Panel::Slots]));
+        assert!(is_complete(&[&wheel, &rest], &[Panel::Sliders]));
+        assert!(!is_complete(&[&wheel, &rest], &[Panel::Wheel]));
+    }
+
+    #[test]
+    fn a_hidden_panel_comes_back_to_the_very_same_arrangement() {
+        for panel in PANELS {
+            let start = Node::stack([92.0, 360.0, 228.0]);
+            let mut node = start.clone();
+            let home = node.hide(panel).unwrap();
+            assert!(!node.panels().contains(&panel));
+            assert_eq!(home.size, Some(start_height(panel)));
+            // The window gives up the length, so the others keep theirs.
+            assert_eq!(node.total(Axis::Vertical), Some(680.0 - start_height(panel)));
+            node.restore(panel, home, 0.0);
+            assert_eq!(node, start);
+        }
+    }
+
+    fn start_height(panel: Panel) -> f32 {
+        match panel {
+            Panel::Slots => 92.0,
+            Panel::Wheel => 360.0,
+            Panel::Sliders => 228.0,
+        }
+    }
+
+    #[test]
+    fn hiding_down_to_a_lone_panel_and_back_keeps_both_lengths() {
+        let mut node = Node::stack([92.0, 360.0, 228.0]);
+        let sliders = node.hide(Panel::Sliders).unwrap();
+        let slots = node.hide(Panel::Slots).unwrap();
+        assert_eq!(node, Node::tabs(vec![Panel::Wheel]));
+        node.restore(Panel::Slots, slots, 360.0);
+        assert_eq!(heights(&node), [92.0, 360.0]);
+        node.restore(Panel::Sliders, sliders, 0.0);
+        assert_eq!(node, Node::stack([92.0, 360.0, 228.0]));
+    }
+
+    #[test]
+    fn a_hidden_tab_returns_to_its_place_and_the_last_panel_cannot_be_hidden() {
+        let start = Node::Tabs { panels: PANELS.to_vec(), active: 1 };
+        let mut node = start.clone();
+        let home = node.hide(Panel::Wheel).unwrap();
+        assert_eq!(home.size, None);
+        node.restore(Panel::Wheel, home, 0.0);
+        assert_eq!(node, start);
+
+        let mut first = Node::tabs(PANELS.to_vec());
+        let home = first.hide(Panel::Slots).unwrap();
+        first.restore(Panel::Slots, home, 0.0);
+        assert_eq!(first.panels(), PANELS);
+
+        assert_eq!(Node::tabs(vec![Panel::Wheel]).hide(Panel::Wheel), None);
     }
 
     #[test]

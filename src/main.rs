@@ -30,7 +30,9 @@ fn main() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Percepta")
             .with_inner_size([380.0, app::DEFAULT_WINDOW_HEIGHT])
-            .with_min_inner_size([240.0, app::MIN_WINDOW_HEIGHT])
+            // As small as it can ever be, or a smaller saved size would not come back. The
+            // app sets the real minimum as soon as it has the panels.
+            .with_min_inner_size([240.0, layout::MIN_HEIGHTS[0]])
             .with_decorations(false)
             .with_maximize_button(false)
             .with_icon(icon)
