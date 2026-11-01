@@ -75,6 +75,10 @@ const DROP_ABOVE_ZONE: f32 = 6.0;
 const DROP_TAB_ZONE: f32 = 20.0;
 /// The part of a module, from its bottom, for landing below it.
 const DROP_BELOW_ZONE: f32 = 24.0;
+/// How far in from a module's left and right edges a drop lands beside it.
+const DROP_SIDE_ZONE: f32 = 40.0;
+/// How far in from a window's edge a drop lands beside all that is in the window.
+const DROP_WINDOW_ZONE: f32 = 10.0;
 /// In physical pixels, at any scale: the edge of a mark where a window would land, and the
 /// whole thickness of the line it goes in along, beside a module or between tabs.
 const DROP_EDGE: i32 = 6;
@@ -283,35 +287,33 @@ impl PanelWindow {
         egui::vec2(self.node.min_size(Axis::Horizontal), height)
     }
 
-    /// Makes a window longer at once, so that the next time it is drawn there is room for what
-    /// has just been added. Then nothing else has to give way.
-    fn grow(&mut self, axis: Axis, by: f32) {
-        self.grown = true;
-        let by = (by * self.scale).round() as i32;
-        let grown = |[width, height]: [i32; 2]| match axis {
-            Axis::Horizontal => [width + by, height],
-            Axis::Vertical => [width, height + by],
-        };
-        match (self.size, self.hwnd) {
-            (Some(size), hwnd) => {
-                self.size = Some(grown(size));
-                if let Some(hwnd) = hwnd {
-                    platform::resize_window(hwnd as _, grown(size));
-                }
-            }
-            (None, _) => match axis {
-                Axis::Horizontal => self.first_size.x += by as f32 / self.scale,
-                Axis::Vertical => self.first_size.y += by as f32 / self.scale,
-            },
+    /// Makes the inside of a window bigger or smaller by this much.
+    fn resize(&mut self, by: egui::Vec2) {
+        let growth = by.max(egui::Vec2::ZERO);
+        if growth != egui::Vec2::ZERO {
+            self.grow(growth);
+        }
+        // Once it has been told its new minimum.
+        if by.min_elem() < 0.0 {
+            self.resize_to = Some(self.inner + by);
         }
     }
 
-    /// Makes a window shorter, once it has been told its new minimum.
-    fn shrink(&mut self, axis: Axis, by: f32) {
-        self.resize_to = Some(match axis {
-            Axis::Horizontal => self.inner - egui::vec2(by, 0.0),
-            Axis::Vertical => self.inner - egui::vec2(0.0, by),
-        });
+    /// At once, so that the next time it is drawn there is room for what has just been added.
+    /// Then nothing else has to give way.
+    fn grow(&mut self, by: egui::Vec2) {
+        self.grown = true;
+        let pixels = |length: f32| (length * self.scale).round() as i32;
+        match (self.size, self.hwnd) {
+            (Some([width, height]), hwnd) => {
+                let size = [width + pixels(by.x), height + pixels(by.y)];
+                self.size = Some(size);
+                if let Some(hwnd) = hwnd {
+                    platform::grow_window(hwnd as _, size);
+                }
+            }
+            (None, _) => self.first_size += by,
+        }
     }
 
     fn to_saved(&self) -> SavedWindow {
@@ -337,12 +339,24 @@ struct Host {
     hwnd: isize,
 }
 
-/// Where a stack of tabs in the main window is, at 100% scale from the window's corner.
+/// Where a stack of tabs in a window is, at 100% scale from the window's corner.
 struct DockTarget {
+    window: u64,
     panels: Vec<Panel>,
     rect: egui::Rect,
     /// Where each tab begins, and where the last one ends.
     tab_edges: Vec<f32>,
+}
+
+/// Where something being dragged would land if dropped now.
+struct DropSpot {
+    window: u64,
+    /// A panel that stays where it is after the drag, so a stack can't land on itself.
+    target: Panel,
+    drop: DockDrop,
+    /// The area to mark for that, at 100% scale from the window's corner: all of a module to
+    /// join its tabs, or with no width or height, the line where it would go.
+    mark: egui::Rect,
 }
 
 pub struct App {
@@ -950,15 +964,13 @@ impl App {
         }
         let window = &mut self.windows[index];
         let title = PanelWindow::title_height(&window.node);
-        let Some(home) = window.node.hide(panel) else {
+        let Some((home, freed)) = window.node.hide(panel) else {
             let id = window.id;
             self.close_window(id);
             return;
         };
-        if let (Some(size), DockDrop::Side { axis, .. }) = (home.size, home.drop) {
-            let by = size + title - PanelWindow::title_height(&window.node);
-            window.shrink(axis, by);
-        }
+        let title = PanelWindow::title_height(&window.node) - title;
+        window.resize(egui::vec2(-freed[0], title - freed[1]));
         self.hidden.push(HiddenPanel { panel, window: window.id, home });
     }
 
@@ -980,16 +992,9 @@ impl App {
         };
         let window = &mut self.windows[index];
         let title = PanelWindow::title_height(&window.node);
-        let own = |axis| match axis {
-            Axis::Horizontal => window.inner.x,
-            Axis::Vertical => window.inner.y,
-        };
-        let axis = if let DockDrop::Side { axis, .. } = home.drop { axis } else { Axis::Vertical };
-        let own = own(axis);
-        window.node.restore(panel, home, own);
-        if let (Some(size), DockDrop::Side { .. }) = (home.size, home.drop) {
-            window.grow(axis, size + PanelWindow::title_height(&window.node) - title);
-        }
+        let more = window.node.restore(panel, home, [window.inner.x, window.inner.y - title]);
+        let title = PanelWindow::title_height(&window.node) - title;
+        window.resize(egui::vec2(more[0], more[1] + title));
         if !window.open {
             self.open_window(index);
         }
@@ -1028,9 +1033,7 @@ impl App {
         let ctx = ui.ctx().clone();
         window.scale = ctx.pixels_per_point();
         window.inner = rect.size();
-        if window.id == MAIN_WINDOW {
-            self.dock_targets.clear();
-        }
+        self.dock_targets.retain(|target| target.window != window.id);
         let min_size = window.min_inner();
         if min_size != window.min_size {
             window.min_size = min_size;
@@ -1039,9 +1042,9 @@ impl App {
         let grown = std::mem::take(&mut window.grown);
         if let Some(size) = window.resize_to.take() {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size.max(min_size)));
-        } else if rect.height() + 0.5 < min_size.y && !grown {
+        } else if (rect.width() + 0.5 < min_size.x || rect.height() + 0.5 < min_size.y) && !grown {
             // Windows only applies a minimum the next time the window is resized.
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(rect.width(), min_size.y)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(rect.size().max(min_size)));
         }
 
         let bar = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), TITLE_BAR_HEIGHT));
@@ -1067,9 +1070,7 @@ impl App {
                 if let Some(torn) = tear {
                     self.start_panel_drag(ui, host, torn, rect);
                 }
-                if window.id == MAIN_WINDOW {
-                    self.dock_targets.push(DockTarget { panels: panels.to_vec(), rect, tab_edges });
-                }
+                self.dock_targets.push(DockTarget { window: window.id, panels: panels.to_vec(), rect, tab_edges });
                 if let Some(&panel) = panels.get(*active).or(panels.first()) {
                     changed = self.panel_ui(ui, panel, below);
                 }
@@ -1162,9 +1163,7 @@ impl App {
         if let Some(panels) = tear {
             self.start_panel_drag(ui, host, panels, rect);
         }
-        if host.id == MAIN_WINDOW {
-            self.dock_targets.push(DockTarget { panels: panels.to_vec(), rect, tab_edges });
-        }
+        self.dock_targets.push(DockTarget { window: host.id, panels: panels.to_vec(), rect, tab_edges });
         if let Some(&panel) = panels.get(*active).or(panels.first()) {
             *changed |= self.panel_ui(ui, panel, content);
         }
@@ -1209,37 +1208,31 @@ impl App {
         }
         let Some(drag) = self.dragging.take() else { return };
         let spot = self.drop_at_cursor(&drag);
-        let over_main = self.cursor_over_main();
+        let over_window = self.window_at_cursor(&drag).is_some();
         let source = self.windows.iter_mut().find(|window| window.id == drag.source);
         // A window has to keep something.
         let Some(source) = source.filter(|window| window.node.panels().len() > drag.panels.len()) else {
             self.ghost.hide();
             return;
         };
-        if spot.is_none() && over_main {
+        if spot.is_none() && over_window {
             self.ghost.hide();
             return;
         }
-        // A whole module leaves the room it took behind, unlike one tab of several.
-        let whole = drag.panels.first().is_some_and(|&panel| source.node.stack_len(panel) == drag.panels.len());
         let title = PanelWindow::title_height(&source.node);
-        let split = if let Node::Split { axis, .. } = source.node { Some(axis) } else { None };
+        let mut freed = egui::Vec2::ZERO;
         for &panel in &drag.panels {
-            source.node.remove(panel);
+            let [x, y] = source.node.lift(panel);
+            freed += egui::vec2(x, y);
         }
-        if let Some((target, drop, _)) = spot {
-            // Moving within a window, that room is for where it lands.
-            self.dock_in_main(target, drop, drag.panels, drag.size, whole && drag.source == MAIN_WINDOW);
+        let change = egui::vec2(0.0, PanelWindow::title_height(&source.node) - title) - freed;
+        if let Some(spot) = spot {
+            self.land(spot, Node::tabs(drag.panels), drag.size, drag.source, change);
             self.ghost.hide();
             ctx.request_repaint();
             return;
         }
-        if let Some(axis) = split.filter(|_| whole) {
-            let length = along(drag.size.to_pos2(), axis);
-            source.node.shrink_last(length);
-            let by = length + title - PanelWindow::title_height(&source.node);
-            source.shrink(axis, by);
-        }
+        source.resize(change);
         let id = self.next_window_id;
         self.next_window_id += 1;
         let mut window = PanelWindow::new(id, Node::tabs(drag.panels), self.windows[0].scale);
@@ -1250,59 +1243,97 @@ impl App {
         ctx.request_repaint();
     }
 
-    /// Beside the others, a module keeps its length and the window grows to make room for it,
-    /// as nothing else should have to give way. `size` is the area it fills now.
-    fn dock_in_main(&mut self, target: Panel, drop: DockDrop, panels: Vec<Panel>, size: egui::Vec2, moved_within: bool) {
-        let main = &mut self.windows[0];
-        let DockDrop::Side { axis, before } = drop else {
-            main.node.dock(target, drop, panels);
-            return;
+    /// Puts `new` where `spot` says. Beside something, it keeps its size and the window grows to
+    /// make room for it, as nothing else should have to give way. `size` is the area it fills
+    /// now, and `change` is what the window it comes from should change by for it having left.
+    fn land(&mut self, spot: DropSpot, new: Node, size: egui::Vec2, from: u64, mut change: egui::Vec2) {
+        if spot.window != from {
+            if let Some(source) = self.windows.iter_mut().find(|window| window.id == from) {
+                source.resize(change);
+            }
+            change = egui::Vec2::ZERO;
+        }
+        let Some(window) = self.windows.iter_mut().find(|window| window.id == spot.window) else { return };
+        let title = PanelWindow::title_height(&window.node);
+        let inner = window.inner + change;
+        let room = [inner.x, inner.y - title];
+        let (axis, before, around) = match spot.drop {
+            DockDrop::Tab(_) => {
+                window.node.dock(spot.target, spot.drop, new.panels());
+                window.resize(change);
+                return;
+            }
+            DockDrop::Side { axis, before } => (axis, before, false),
+            DockDrop::Around { axis, before } => (axis, before, true),
         };
-        let title = PanelWindow::title_height(&main.node);
-        let length = along(size.to_pos2(), axis).max(Node::tabs(panels.clone()).min_size(axis));
-        let own = along(main.inner.to_pos2(), axis) - title;
-        if moved_within {
-            main.node.shrink_last(length);
-            main.node.dock_sized(target, axis, before, panels, length, own - length);
-        } else if main.node.dock_sized(target, axis, before, panels, length, own) {
-            main.grow(axis, length + PanelWindow::title_height(&main.node) - title);
-        }
+        let more = window.node.insert(spot.target, axis, before, around, new, [size.x, size.y], room);
+        let title = PanelWindow::title_height(&window.node) - title;
+        window.resize(change + egui::vec2(more[0], more[1] + title));
     }
 
-    fn cursor_over_main(&self) -> bool {
-        let main = &self.windows[0];
-        let (Some(position), Some(size), true) = (main.position, main.size, main.open) else { return false };
+    /// The window in front at the cursor, other than one that is itself being moved.
+    fn window_at_cursor(&self, drag: &PanelDrag) -> Option<&PanelWindow> {
+        let source = self.windows.iter().find(|window| window.id == drag.source);
+        let moved = source.filter(|window| window.node.panels().len() == drag.panels.len()).map(|window| window.id);
         let [x, y] = platform::cursor_position();
-        (position[0]..position[0] + size[0]).contains(&x) && (position[1]..position[1] + size[1]).contains(&y)
+        let under = self.windows.iter().filter(|window| window.open && Some(window.id) != moved).filter(|window| {
+            let (Some(position), Some(size)) = (window.position, window.size) else { return false };
+            (position[0]..position[0] + size[0]).contains(&x) && (position[1]..position[1] + size[1]).contains(&y)
+        });
+        under.reduce(|front, window| match (window.hwnd, front.hwnd) {
+            (Some(hwnd), Some(other)) if platform::is_above(hwnd as _, other as _) => window,
+            _ => front,
+        })
     }
 
-    /// Where `drag`, dropped at the cursor, would land in the main window, and the area to
-    /// mark for that, at 100% scale from the window's corner: all of a module to join its
-    /// tabs, or with no width or height, the line where it would go in between tabs or beside
-    /// a module. The target is a panel that stays where it is after the drag, so a stack can't
-    /// land on itself.
-    fn drop_at_cursor(&self, drag: &PanelDrag) -> Option<(Panel, DockDrop, egui::Rect)> {
-        if !self.cursor_over_main() {
-            return None;
-        }
-        let main = &self.windows[0];
-        let position = main.position?;
+    /// Where `drag`, dropped at the cursor, would land.
+    fn drop_at_cursor(&self, drag: &PanelDrag) -> Option<DropSpot> {
+        let window = self.window_at_cursor(drag)?;
+        let position = window.position?;
         let [x, y] = platform::cursor_position();
-        let point = egui::pos2((x - position[0]) as f32, (y - position[1]) as f32) / main.scale;
-        // The title bar above the first module counts as the top of that module.
-        let target = self.dock_targets.iter().find(|target| target.rect.contains(point)).or_else(|| {
-            self.dock_targets.first().filter(|first| point.y < first.rect.top())
+        let point = egui::pos2((x - position[0]) as f32, (y - position[1]) as f32) / window.scale;
+        let moving = |panel: &Panel| drag.source == window.id && drag.panels.contains(panel);
+        let spot = |target, drop, mark| DropSpot { window: window.id, target, drop, mark };
+
+        // At a window's own edge, against a split that runs the other way.
+        let inner = window.inner;
+        let edge = match window.node {
+            Node::Split { axis: Axis::Vertical, .. } if point.x < DROP_WINDOW_ZONE => Some((Axis::Horizontal, true)),
+            Node::Split { axis: Axis::Vertical, .. } if point.x > inner.x - DROP_WINDOW_ZONE => Some((Axis::Horizontal, false)),
+            Node::Split { axis: Axis::Horizontal, .. } if point.y < TITLE_BAR_HEIGHT => Some((Axis::Vertical, true)),
+            Node::Split { axis: Axis::Horizontal, .. } if point.y > inner.y - DROP_WINDOW_ZONE => Some((Axis::Vertical, false)),
+            _ => None,
+        };
+        if let Some((axis, before)) = edge {
+            let &target = window.node.panels().iter().find(|panel| !moving(panel))?;
+            let all = egui::Rect::from_min_max(egui::pos2(0.0, TITLE_BAR_HEIGHT), inner.to_pos2());
+            let mark = match (axis, before) {
+                (Axis::Horizontal, true) => all.with_max_x(all.left()),
+                (Axis::Horizontal, false) => all.with_min_x(all.right()),
+                (Axis::Vertical, true) => all.with_max_y(all.top()),
+                (Axis::Vertical, false) => all.with_min_y(all.bottom()),
+            };
+            return Some(spot(target, DockDrop::Around { axis, before }, mark));
+        }
+
+        let targets = || self.dock_targets.iter().filter(|target| target.window == window.id);
+        // The title bar above a module counts as the top of that module.
+        let target = targets().find(|target| target.rect.contains(point)).or_else(|| {
+            let below = targets().filter(|target| target.rect.x_range().contains(point.x) && point.y < target.rect.top());
+            below.min_by(|a, b| a.rect.top().total_cmp(&b.rect.top()))
         })?;
-        let moving = |panel: &&Panel| drag.source == MAIN_WINDOW && drag.panels.contains(panel);
         let &panel = target.panels.iter().find(|panel| !moving(panel))?;
         let rect = target.rect;
         let strip_bottom = rect.top() + MODULE_TITLE_HEIGHT;
-        let side = |before: bool, line: f32| {
-            let mark = egui::Rect::from_x_y_ranges(rect.x_range(), line..=line);
-            (panel, DockDrop::Side { axis: Axis::Vertical, before }, mark)
+        let side = |axis, before: bool, line: f32| {
+            let mark = match axis {
+                Axis::Horizontal => egui::Rect::from_x_y_ranges(line..=line, rect.y_range()),
+                Axis::Vertical => egui::Rect::from_x_y_ranges(rect.x_range(), line..=line),
+            };
+            spot(panel, DockDrop::Side { axis, before }, mark)
         };
         if point.y < rect.top() + DROP_ABOVE_ZONE {
-            return Some(side(true, rect.top()));
+            return Some(side(Axis::Vertical, true, rect.top()));
         }
         if point.y < strip_bottom + DROP_TAB_ZONE {
             let tab_centers = target.tab_edges.windows(2).map(|tab| (tab[0] + tab[1]) / 2.0);
@@ -1311,12 +1342,18 @@ impl App {
             let mark = egui::Rect::from_x_y_ranges(line..=line, rect.top()..=strip_bottom);
             // Where that is once what is moving has left, if it comes from these same tabs.
             let leaving = target.panels[..index.min(target.panels.len())].iter().filter(|panel| moving(panel)).count();
-            return Some((panel, DockDrop::Tab(index - leaving), mark));
+            return Some(spot(panel, DockDrop::Tab(index - leaving), mark));
         }
         if point.y > rect.bottom() - DROP_BELOW_ZONE {
-            return Some(side(false, rect.bottom()));
+            return Some(side(Axis::Vertical, false, rect.bottom()));
         }
-        Some((panel, DockDrop::Tab(usize::MAX), rect))
+        if point.x < rect.left() + DROP_SIDE_ZONE {
+            return Some(side(Axis::Horizontal, true, rect.left()));
+        }
+        if point.x > rect.right() - DROP_SIDE_ZONE {
+            return Some(side(Axis::Horizontal, false, rect.right()));
+        }
+        Some(spot(panel, DockDrop::Tab(usize::MAX), rect))
     }
 
     /// Windows take their own title bar drags, and say when one has ended.
@@ -1325,10 +1362,11 @@ impl App {
         let Some(index) = self.windows.iter().position(|window| window.id != MAIN_WINDOW && window.hwnd == Some(hwnd)) else { return };
         let window = &self.windows[index];
         let panels = window.node.panels();
-        let drag = PanelDrag { source: window.id, panels, size: window.inner, grab: [0, 0] };
-        if let Some((target, drop, _)) = self.drop_at_cursor(&drag) {
-            self.windows.remove(index);
-            self.dock_in_main(target, drop, drag.panels, drag.size, false);
+        let size = window.inner - egui::vec2(0.0, PanelWindow::title_height(&window.node));
+        let drag = PanelDrag { source: window.id, panels, size, grab: [0, 0] };
+        if let Some(spot) = self.drop_at_cursor(&drag) {
+            let window = self.windows.remove(index);
+            self.land(spot, window.node, drag.size, drag.source, egui::Vec2::ZERO);
             ctx.request_repaint();
         }
     }
@@ -1349,12 +1387,14 @@ impl App {
         };
         ctx.request_repaint();
         let spot = self.drop_at_cursor(drag);
-        let main = &self.windows[0];
-        let (Some((_, _, rect)), Some(position), Some(size)) = (spot, main.position, main.size) else {
+        let found = spot.and_then(|spot| {
+            let window = self.windows.iter().find(|window| window.id == spot.window)?;
+            Some((spot.mark, window.position?, window.size?, window.scale))
+        });
+        let Some((rect, position, size, scale)) = found else {
             self.drop_indicator.hide();
             return;
         };
-        let scale = main.scale;
         let pixels = |value: f32| (value * scale).round() as i32;
         // A line along one axis is kept whole at the window's edge.
         let line = |at: f32, length: i32| {
@@ -1382,10 +1422,14 @@ impl App {
 
     fn floating_window(&mut self, ctx: &egui::Context, window: &mut PanelWindow) {
         let title = window.title();
+        // A window back from a saved layout has only its outer size on record, for later. Once
+        // it exists this has to stay the same, as any change here would resize it.
+        if window.hwnd.is_none() {
+            window.first_size = window.first_size.max(window.min_inner());
+        }
         let builder = egui::ViewportBuilder::default()
             .with_title(title.clone())
-            // A window back from a saved layout has only its outer size on record, for later.
-            .with_inner_size(window.first_size.max(window.min_inner()))
+            .with_inner_size(window.first_size)
             .with_min_inner_size(window.min_inner())
             .with_decorations(false)
             .with_maximize_button(false)

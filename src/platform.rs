@@ -497,6 +497,38 @@ pub fn resize_window(hwnd: HWND, [width, height]: [i32; 2]) {
     unsafe { SetWindowPos(hwnd, ptr::null_mut(), 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) };
 }
 
+/// Makes a window bigger, and moves it if that would take it off its monitor's work area.
+pub fn grow_window(hwnd: HWND, [width, height]: [i32; 2]) {
+    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    // SAFETY: an all-zero MONITORINFO is valid, every pointer is to a local that outlives its
+    // call, and a stale handle only makes the calls fail.
+    unsafe {
+        GetWindowRect(hwnd, &mut rect);
+        let mut monitor: MONITORINFO = std::mem::zeroed();
+        monitor.cbSize = size_of::<MONITORINFO>() as u32;
+        GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut monitor);
+        let work = monitor.rcWork;
+        let x = rect.left.min(work.right - width).max(work.left);
+        let y = rect.top.min(work.bottom - height).max(work.top);
+        SetWindowPos(hwnd, ptr::null_mut(), x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+/// Whether window `a` is in front of window `b`.
+pub fn is_above(a: HWND, b: HWND) -> bool {
+    // SAFETY: plain window queries; a window that has vanished ends the walk.
+    unsafe {
+        let mut above = GetWindow(b, GW_HWNDPREV);
+        while !above.is_null() {
+            if above == a {
+                return true;
+            }
+            above = GetWindow(above, GW_HWNDPREV);
+        }
+    }
+    false
+}
+
 /// The first window below `hwnd` that a user would count as an open window.
 fn next_app_window(hwnd: HWND) -> HWND {
     // SAFETY: plain window queries; a window that has vanished ends the walk.
