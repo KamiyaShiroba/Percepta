@@ -1,12 +1,20 @@
 [package]
 name = "percepta"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 description = "Colour picker for Clip Studio Paint, connected over Companion Mode"
 license = "MIT"
 
 [dependencies]
-eframe = "0.37"
+# Glow instead of the default wgpu, which holds about 15 times the video memory, beside CSP.
+eframe = { version = "0.37", default-features = false, features = [
+    "accesskit",
+    "clipboard",
+    "default_fonts",
+    "glow",
+    "links",
+    "system_fonts",
+] }
 lcms2 = "6"
 rand = "0.8"
 raw-window-handle = "0.6"
@@ -44,3 +52,8 @@ opt-level = 1
 # Screen capture and QR decoding are too slow unoptimised, even in dev builds.
 [profile.dev.package."*"]
 opt-level = 2
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true

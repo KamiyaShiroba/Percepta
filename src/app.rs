@@ -56,6 +56,9 @@ const SETTINGS_MIN_SIZE: [f32; 2] = [240.0, 300.0];
 const HIDDEN_REPAINT_INTERVAL: Duration = Duration::from_secs(1);
 /// How often the numbers in the settings window are brought up to date.
 const STATS_REFRESH: Duration = Duration::from_secs(1);
+/// The shortest time between frames. Without vsync, a pen's many events would otherwise draw
+/// every window far more often than any screen shows.
+const FRAME_INTERVAL: Duration = Duration::from_millis(8);
 const TITLE_BAR_FILL: Color32 = Color32::from_gray(232);
 const TITLE_TEXT: Color32 = Color32::from_gray(90);
 const TITLE_FONT_SIZE: f32 = 12.0;
@@ -390,6 +393,8 @@ pub struct App {
     event_tx: Sender<Event>,
     scan_rx: Option<Receiver<ScanResult>>,
 
+    frames: FrameStats,
+
     color: ColorState,
     picker: Picker,
     /// What CSP should currently hold, so drags within one byte send nothing.
@@ -537,6 +542,7 @@ impl App {
             last_sent: rgb,
             hex: to_hex(rgb),
             last_edit: None,
+            frames: FrameStats::default(),
             recent_sent: VecDeque::new(),
             slots,
             last_slot_choice: None,
@@ -2117,6 +2123,48 @@ impl App {
         let ms = |value: f32| format!("{value:.1}");
         ui.label(tr!("diagnostics.reads", self.reads_per_second, ms(self.read_ms), ms(self.read_max_ms)));
         ui.label(tr!("diagnostics.writes", ms(self.write_ms), self.writes, self.rejected));
+        let (frames, average, max) = self.frames.shown;
+        ui.label(tr!("diagnostics.frames", frames, ms(average), ms(max)));
+    }
+}
+
+/// Paces the frames, and adds up what they cost for the settings window. Every window is drawn
+/// within the main one's frame, so this sees them all.
+struct FrameStats {
+    previous: Instant,
+    paused: Duration,
+    window_start: Instant,
+    frames: u32,
+    busy: f32,
+    busiest: f32,
+    /// Frames in the last second, and their average and longest time in ms.
+    shown: (u32, f32, f32),
+}
+
+impl Default for FrameStats {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self { previous: now, paused: Duration::ZERO, window_start: now, frames: 0, busy: 0.0, busiest: 0.0, shown: (0, 0.0, 0.0) }
+    }
+}
+
+impl FrameStats {
+    /// `last_frame` is how long the last frame took in seconds, this pause included.
+    fn begin(&mut self, last_frame: Option<f32>) {
+        let busy = (last_frame.unwrap_or(0.0) - self.paused.as_secs_f32()).max(0.0) * 1000.0;
+        self.frames += 1;
+        self.busy += busy;
+        self.busiest = self.busiest.max(busy);
+        if self.window_start.elapsed() >= STATS_REFRESH {
+            self.shown = (self.frames, self.busy / self.frames as f32, self.busiest);
+            (self.frames, self.busy, self.busiest) = (0, 0.0, 0.0);
+            self.window_start = Instant::now();
+        }
+        self.paused = FRAME_INTERVAL.saturating_sub(self.previous.elapsed());
+        if !self.paused.is_zero() {
+            thread::sleep(self.paused);
+        }
+        self.previous = Instant::now();
     }
 }
 
@@ -2137,7 +2185,8 @@ impl Drop for App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.frames.begin(frame.info().cpu_usage);
         let ctx = ui.ctx().clone();
         self.poll_events();
         self.poll_scan(&ctx);

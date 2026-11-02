@@ -9,11 +9,19 @@ use std::time::{Duration, Instant};
 use super::auth::Pairing;
 use super::client::{Client, CspSlots, Error};
 use super::{Rgb, Slot};
-use crate::platform::ForegroundWatch;
+use crate::platform::{pressing_outside_percepta, ForegroundWatch};
 
 /// Polling rate right after the colour changed, to follow a drag on CSP's wheel.
 const ACTIVE_POLL: Duration = Duration::from_millis(16);
 const IDLE_POLL: Duration = Duration::from_millis(50);
+/// Polling rate once CSP's colour has not changed for `SETTLED_AFTER`.
+const SETTLED_POLL: Duration = Duration::from_millis(100);
+const SETTLED_AFTER: Duration = Duration::from_secs(10);
+/// Polling rate while pressing on CSP without the colour changing, which is mostly drawing: every
+/// read is work for CSP in the middle of a stroke.
+const PRESSED_POLL: Duration = Duration::from_millis(200);
+/// A press with a change this recent is more likely a drag on CSP's wheel, to keep following.
+const PRESSED_CHANGE_WINDOW: Duration = Duration::from_millis(200);
 const BACKGROUND_POLL: Duration = Duration::from_secs(2);
 const ACTIVE_WINDOW: Duration = Duration::from_millis(1500);
 const FOREGROUND_CHECK_INTERVAL: Duration = Duration::from_millis(250);
@@ -142,13 +150,17 @@ fn wait_before_retry(wait: Duration, writes: &mut VecDeque<Write>, inbox: &Recei
 
 /// A recent change wins over the foreground state: the sliders can write to CSP
 /// while another app is in front, and that write should still read back quickly.
-fn poll_interval(since_change: Duration, csp_in_front: bool) -> Duration {
-    if since_change < ACTIVE_WINDOW {
+fn poll_interval(since_change: Duration, csp_in_front: bool, pressing: bool) -> Duration {
+    if csp_in_front && pressing && since_change >= PRESSED_CHANGE_WINDOW {
+        PRESSED_POLL
+    } else if since_change < ACTIVE_WINDOW {
         ACTIVE_POLL
-    } else if csp_in_front {
+    } else if !csp_in_front {
+        BACKGROUND_POLL
+    } else if since_change < SETTLED_AFTER {
         IDLE_POLL
     } else {
-        BACKGROUND_POLL
+        SETTLED_POLL
     }
 }
 
@@ -301,7 +313,8 @@ fn run(
                     client.wake()?;
                 }
             }
-            next_poll = Instant::now() + poll_interval(last_change.elapsed(), csp_in_front);
+            let pressing = pressing_outside_percepta();
+            next_poll = Instant::now() + poll_interval(last_change.elapsed(), csp_in_front, pressing);
         }
 
         if Instant::now() >= next_heartbeat {
@@ -449,10 +462,21 @@ mod tests {
 
     #[test]
     fn polls_by_recent_change_then_foreground() {
-        assert_eq!(poll_interval(Duration::ZERO, true), ACTIVE_POLL);
-        assert_eq!(poll_interval(Duration::ZERO, false), ACTIVE_POLL);
-        assert_eq!(poll_interval(ACTIVE_WINDOW, true), IDLE_POLL);
-        assert_eq!(poll_interval(ACTIVE_WINDOW, false), BACKGROUND_POLL);
+        assert_eq!(poll_interval(Duration::ZERO, true, false), ACTIVE_POLL);
+        assert_eq!(poll_interval(Duration::ZERO, false, false), ACTIVE_POLL);
+        assert_eq!(poll_interval(ACTIVE_WINDOW, true, false), IDLE_POLL);
+        assert_eq!(poll_interval(ACTIVE_WINDOW, false, false), BACKGROUND_POLL);
+        assert_eq!(poll_interval(SETTLED_AFTER, true, false), SETTLED_POLL);
+        assert_eq!(poll_interval(SETTLED_AFTER, false, false), BACKGROUND_POLL);
+    }
+
+    #[test]
+    fn a_press_on_csp_slows_polling_unless_the_colour_is_changing() {
+        assert_eq!(poll_interval(PRESSED_CHANGE_WINDOW, true, true), PRESSED_POLL);
+        assert_eq!(poll_interval(SETTLED_AFTER, true, true), PRESSED_POLL);
+        assert_eq!(poll_interval(Duration::ZERO, true, true), ACTIVE_POLL);
+        // The press is somewhere else, and has nothing to do with CSP.
+        assert_eq!(poll_interval(ACTIVE_WINDOW, false, true), BACKGROUND_POLL);
     }
 
     #[test]

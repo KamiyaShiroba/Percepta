@@ -25,7 +25,7 @@ use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWi
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateIcon, DispatchMessageW, FindWindowW, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow,
     GetSystemMetrics, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic,
-    IsWindowVisible, MsgWaitForMultipleObjects, PeekMessageW, SendMessageTimeoutW, SetForegroundWindow,
+    IsWindowVisible, MessageBoxW, MsgWaitForMultipleObjects, PeekMessageW, MB_ICONERROR, MB_OK, SendMessageTimeoutW, SetForegroundWindow,
     SetWindowLongPtrW, SetWindowPos, WindowFromPoint, EVENT_SYSTEM_FOREGROUND, GA_ROOTOWNER, GWL_EXSTYLE,
     GW_HWNDNEXT, GW_HWNDPREV, HICON, HTCAPTION, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, MA_NOACTIVATE, MSG,
     PM_REMOVE, QS_ALLINPUT, SMTO_ABORTIFHUNG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
@@ -769,6 +769,30 @@ pub fn raise_new_window(hwnd: HWND) {
 pub fn pen_or_mouse_down() -> bool {
     // SAFETY: takes no pointers. The high bit is set while the button is down.
     unsafe { GetAsyncKeyState(VK_LBUTTON as i32) < 0 }
+}
+
+/// Whether the pen or mouse is down anywhere but on Percepta's own windows.
+pub fn pressing_outside_percepta() -> bool {
+    if !pen_or_mouse_down() {
+        return false;
+    }
+    let mut cursor = POINT { x: 0, y: 0 };
+    let mut pid = 0;
+    // SAFETY: `cursor` and `pid` are valid for writes, and `pid` stays 0 if there is no window.
+    unsafe {
+        if GetCursorPos(&mut cursor) == 0 {
+            return false;
+        }
+        GetWindowThreadProcessId(WindowFromPoint(cursor), &mut pid);
+        pid != GetCurrentProcessId()
+    }
+}
+
+/// Tells the user about something that stops the program, when no window of its own can.
+pub fn show_error(text: &str) {
+    let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: both strings end in a zero and outlive the call, which blocks until it is answered.
+    unsafe { MessageBoxW(ptr::null_mut(), text.as_ptr(), windows_sys::w!("Percepta"), MB_ICONERROR | MB_OK) };
 }
 
 /// After the pen touches Percepta, the tablet driver treats it as the current

@@ -202,6 +202,7 @@ mod tests {
         include_str!("platform.rs"),
         include_str!("tray.rs"),
         include_str!("update.rs"),
+        include_str!("main.rs"),
         include_str!("csp/client.rs"),
         include_str!("csp/worker.rs"),
     ];

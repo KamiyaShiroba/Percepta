@@ -44,11 +44,20 @@ fn main() -> eframe::Result {
             .with_maximize_button(false)
             .with_icon(icon)
             .with_active(false),
+        // The driver busy-waits through every window's swap, which took more than a whole core
+        // with three windows. The desktop compositor keeps frames whole, and the app paces them.
+        glow_options: eframe::egui_glow::GlowConfiguration { vsync: false, ..Default::default() },
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "Percepta",
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
-    )
+    );
+    // There is no console to see this on, and a program that just doesn't open explains nothing.
+    if let Err(e) = &result {
+        i18n::set(&session::load_settings().language);
+        platform::show_error(&i18n::tr!("error.graphics", e));
+    }
+    result
 }
