@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::i18n;
 use crate::color::Model;
 use crate::csp::auth::Pairing;
 use crate::csp::{Rgb, Slot};
@@ -79,18 +80,20 @@ pub struct SavedColors {
     pub sub: Rgb,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SavedSettings {
     pub restore_csp: bool,
     pub check_updates: bool,
     /// The background process that follows CSP.
     pub daemon: bool,
+    /// The code of a language, or `i18n::SYSTEM`.
+    pub language: String,
 }
 
 impl Default for SavedSettings {
     fn default() -> Self {
-        Self { restore_csp: true, check_updates: true, daemon: false }
+        Self { restore_csp: true, check_updates: true, daemon: false, language: i18n::SYSTEM.to_owned() }
     }
 }
 

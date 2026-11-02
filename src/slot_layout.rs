@@ -22,7 +22,7 @@ const ROW_GAP: f32 = 3.0;
 const ITEM_GAP: f32 = 8.0;
 const HEX_LABEL_WIDTH: f32 = 24.0;
 const HEX_WIDTH: f32 = 76.0;
-const STATUS_WIDTH: f32 = 42.0;
+const STATUS_WIDTH: f32 = 52.0;
 pub const DOT_SIZE: f32 = 9.0;
 const SETTINGS_SIZE: f32 = 22.0;
 /// How far the background slot sits from the foreground one, relative to their size.

@@ -1,6 +1,7 @@
 //! Finds newer releases on GitHub and installs them. Requests go through WinHTTP so
 //! that they follow the system proxy, which GitHub often can't be reached without.
 
+use crate::i18n::tr;
 use std::ffi::c_void;
 use std::fs::{self, File};
 use std::io::Write;
@@ -54,21 +55,21 @@ struct ApiAsset {
 }
 
 fn parse_release(json: &str) -> Result<Release, String> {
-    let api: ApiRelease = serde_json::from_str(json).map_err(|e| format!("发行信息读不懂：{e}"))?;
+    let api: ApiRelease = serde_json::from_str(json).map_err(|e| tr!("update.error.release", e))?;
     let version = Version::parse(api.tag_name.trim_start_matches('v'))
-        .map_err(|e| format!("版本号 {} 读不懂：{e}", api.tag_name))?;
+        .map_err(|e| tr!("update.error.version", api.tag_name, e))?;
     let installer_name = format!("Percepta-Setup-{version}.exe");
     let asset = api
         .assets
         .into_iter()
         .find(|asset| asset.name == installer_name)
-        .ok_or_else(|| format!("{version} 没有安装包"))?;
+        .ok_or_else(|| tr!("update.error.no_installer", version))?;
     // Never run a download that can't be checked.
     let sha256 = asset
         .digest
         .as_deref()
         .and_then(|digest| digest.strip_prefix("sha256:"))
-        .ok_or_else(|| format!("{version} 的安装包没有校验值"))?
+        .ok_or_else(|| tr!("update.error.no_checksum", version))?
         .to_owned();
     Ok(Release { version, page: api.html_url, installer_name, installer_url: asset.browser_download_url, sha256 })
 }
@@ -87,17 +88,17 @@ fn latest_release() -> Result<Option<Release>, String> {
     match status {
         HTTP_OK => parse_release(&String::from_utf8_lossy(&body)).map(Some),
         HTTP_NOT_FOUND => Ok(None),
-        status => Err(format!("GitHub 返回了 {status}")),
+        status => Err(tr!("update.error.github", status)),
     }
 }
 
 /// Saves the file to `path`, or to nowhere at all if it doesn't match `sha256`.
 fn download(url: &str, sha256: &str, path: &Path, mut progress: impl FnMut(f32)) -> Result<(), String> {
-    let mut file = File::create(path).map_err(|e| format!("建不了文件：{e}"))?;
+    let mut file = File::create(path).map_err(|e| tr!("update.error.create_file", e))?;
     let mut hash = Sha256::new();
     let mut received = 0u64;
     let status = http_get(url, |chunk, total| {
-        file.write_all(chunk).map_err(|e| format!("写不了文件：{e}"))?;
+        file.write_all(chunk).map_err(|e| tr!("update.error.write_file", e))?;
         hash.update(chunk);
         received += chunk.len() as u64;
         if let Some(total) = total.filter(|&total| total > 0) {
@@ -108,8 +109,8 @@ fn download(url: &str, sha256: &str, path: &Path, mut progress: impl FnMut(f32))
     drop(file);
     let result = match status {
         Ok(HTTP_OK) if to_hex(&hash.finalize()).eq_ignore_ascii_case(sha256) => Ok(()),
-        Ok(HTTP_OK) => Err("下载的文件校验不通过".to_owned()),
-        Ok(status) => Err(format!("下载时服务器返回了 {status}")),
+        Ok(HTTP_OK) => Err(tr!("update.error.checksum").to_owned()),
+        Ok(status) => Err(tr!("update.error.download", status)),
         Err(reason) => Err(reason),
     };
     if result.is_err() {
@@ -128,10 +129,10 @@ fn download_dir() -> PathBuf {
 
 fn download_and_run(release: &Release, progress: impl FnMut(f32)) -> Result<(), String> {
     let dir = download_dir();
-    fs::create_dir_all(&dir).map_err(|e| format!("建不了下载目录：{e}"))?;
+    fs::create_dir_all(&dir).map_err(|e| tr!("update.error.folder", e))?;
     let path = dir.join(&release.installer_name);
     download(&release.installer_url, &release.sha256, &path, progress)?;
-    Command::new(&path).args(INSTALLER_ARGS).spawn().map_err(|e| format!("启动不了安装包：{e}"))?;
+    Command::new(&path).args(INSTALLER_ARGS).spawn().map_err(|e| tr!("update.error.start_installer", e))?;
     Ok(())
 }
 
@@ -223,7 +224,7 @@ impl Drop for Handle {
 }
 
 fn last_error(what: &str) -> String {
-    format!("{what}失败（错误 {}）", std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    tr!("update.error.step", what, std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -244,7 +245,7 @@ fn http_get(
     parts.dwHostNameLength = u32::MAX;
     parts.dwUrlPathLength = u32::MAX;
     if unsafe { WinHttpCrackUrl(url_wide.as_ptr(), 0, 0, &mut parts) } == 0 {
-        return Err(last_error("解析网址"));
+        return Err(last_error(tr!("update.step.parse")));
     }
     // SAFETY: as above, the pointer and length describe part of `url_wide`.
     let host = unsafe { std::slice::from_raw_parts(parts.lpszHostName, parts.dwHostNameLength as usize) };
@@ -260,20 +261,20 @@ fn http_get(
     unsafe {
         let session = Handle::new(
             WinHttpOpen(agent.as_ptr(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, null(), null(), 0),
-            "打开网络",
+            tr!("update.step.open"),
         )?;
-        let connection = Handle::new(WinHttpConnect(session.0, host.as_ptr(), parts.nPort, 0), "连接")?;
+        let connection = Handle::new(WinHttpConnect(session.0, host.as_ptr(), parts.nPort, 0), tr!("connect.connect"))?;
         let request = Handle::new(
             WinHttpOpenRequest(connection.0, verb.as_ptr(), path, null(), null(), null(), flags),
-            "创建请求",
+            tr!("update.step.request"),
         )?;
         if WinHttpSendRequest(request.0, null(), 0, null(), 0, 0, 0) == 0 {
-            return Err(last_error("发送请求"));
+            return Err(last_error(tr!("update.step.send")));
         }
         if WinHttpReceiveResponse(request.0, null_mut()) == 0 {
-            return Err(last_error("接收响应"));
+            return Err(last_error(tr!("update.step.receive")));
         }
-        let status = query_number(request.0, WINHTTP_QUERY_STATUS_CODE).ok_or("响应没有状态码")?;
+        let status = query_number(request.0, WINHTTP_QUERY_STATUS_CODE).ok_or(tr!("update.error.no_status"))?;
         if status != HTTP_OK {
             return Ok(status);
         }
@@ -282,7 +283,7 @@ fn http_get(
         loop {
             let mut read = 0u32;
             if WinHttpReadData(request.0, buffer.as_mut_ptr().cast(), READ_CHUNK as u32, &mut read) == 0 {
-                return Err(last_error("读取数据"));
+                return Err(last_error(tr!("update.step.read")));
             }
             if read == 0 {
                 return Ok(status);

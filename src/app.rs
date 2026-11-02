@@ -16,13 +16,14 @@ use crate::csp::client::CspSlots;
 use crate::csp::worker::{Command, Event, Worker};
 use crate::csp::{Rgb, Slot};
 use crate::frame::{self, CORNER_RADIUS, DRAG_THRESHOLD, TITLE_BAR_HEIGHT, TITLE_BUTTON_WIDTH};
+use crate::i18n::tr;
 use crate::layout::{self, Axis, Drop as DockDrop, Flexible, Fold, Home, Node, Panel, DEFAULT_HEIGHTS, MODULE_TITLE_HEIGHT, PANELS};
 use crate::picker::{app_icon_pixels, switch, IconButton, Picker};
 use crate::platform::{self, click_csp_title_bar, pen_or_mouse_down, PaletteWindow};
 use crate::session::{HiddenPanel, SavedColors, SavedLayout, SavedSettings, SavedWindow};
 use crate::tray::{self, Tray};
 use crate::update::{self, Updater};
-use crate::{daemon, qr, session, slot_layout};
+use crate::{daemon, i18n, qr, session, slot_layout};
 
 /// A read-back matching a colour sent this recently is our own echo, not an edit
 /// made in CSP, so it must not make the sliders jump back.
@@ -49,7 +50,7 @@ const CONNECTED: Color32 = Color32::from_rgb(70, 180, 100);
 const WAITING: Color32 = Color32::from_rgb(205, 180, 40);
 const DISCONNECTED: Color32 = Color32::from_gray(150);
 const SETTINGS_TITLE: &str = "Percepta 设置";
-const SETTINGS_SIZE: [f32; 2] = [320.0, 520.0];
+const SETTINGS_SIZE: [f32; 2] = [320.0, 570.0];
 const SETTINGS_MIN_SIZE: [f32; 2] = [240.0, 300.0];
 /// A hidden window only needs to keep up with CSP's reports now and then.
 const HIDDEN_REPAINT_INTERVAL: Duration = Duration::from_secs(1);
@@ -85,7 +86,7 @@ const SPLITTER_ACTIVE: Color32 = Color32::from_gray(120);
 pub const DEFAULT_WINDOW_HEIGHT: f32 =
     TITLE_BAR_HEIGHT + DEFAULT_HEIGHTS[0] + DEFAULT_HEIGHTS[1] + DEFAULT_HEIGHTS[2];
 /// Room beside the address field for its button.
-const CONNECT_BUTTON_ROOM: f32 = 52.0;
+const CONNECT_BUTTON_ROOM: f32 = 76.0;
 const LOG_HEIGHT: f32 = 160.0;
 const CHECKER_SIZE: f32 = 6.0;
 const CHECKER_LIGHT: Color32 = Color32::from_gray(235);
@@ -194,11 +195,14 @@ impl Slots {
 }
 
 /// Enough of the common CJK range for this UI; first match wins.
-const FONT_CANDIDATES: [&str; 3] = [
-    "C:/Windows/Fonts/msyh.ttc",
-    "C:/Windows/Fonts/simhei.ttf",
-    "C:/Windows/Fonts/simsun.ttc",
-];
+const FONT_FOLDER: &str = "C:/Windows/Fonts/";
+/// The first of these that is there, for the Chinese and kana that any language's names need.
+const COMMON_FONTS: [&str; 3] = ["msyh.ttc", "simhei.ttf", "simsun.ttc"];
+/// The only one that has Hangul, for the name of Korean in the list of languages.
+const HANGUL_FONT: &str = "malgun.ttf";
+const YU_GOTHIC: &str = "YuGothR.ttc";
+/// Its plain face sits far above the Latin text beside it, and the one for interfaces does not.
+const YU_GOTHIC_UI_INDEX: u32 = 1;
 
 #[derive(PartialEq, Eq)]
 enum Link {
@@ -453,7 +457,6 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        install_cjk_font(&cc.egui_ctx);
         // Labels here are controls' captions, not text anyone reads to copy. Selecting
         // them only gets in the way of a pen. Text fields are not affected.
         cc.egui_ctx.all_styles_mut(|style| style.interaction.selectable_labels = false);
@@ -509,6 +512,8 @@ impl App {
         }));
         let next_window_id = windows.iter().map(|window| window.id).max().unwrap_or(MAIN_WINDOW) + 1;
         let settings = session::load_settings();
+        i18n::set(&settings.language);
+        install_fonts(&cc.egui_ctx);
         let mut updater = Updater::new();
         if settings.check_updates {
             updater.check(&cc.egui_ctx);
@@ -517,8 +522,8 @@ impl App {
             window,
             keyboards: HashMap::new(),
             restore_after_typing: false,
-            settings,
-            saved_settings: Saved::new(settings),
+            settings: settings.clone(),
+            saved_settings: Saved::new(settings.clone()),
             updater,
             restore_at: None,
             last_restore: None,
@@ -576,9 +581,12 @@ impl App {
             log: VecDeque::new(),
             saved: session::load(),
         };
+        for problem in i18n::problems() {
+            app.log(problem.clone());
+        }
         if app.settings.daemon {
             if let Err(e) = daemon::set_enabled(true) {
-                app.log(format!("启动后台进程失败：{e}"));
+                app.log(tr!("log.daemon_start_failed", e));
             }
         }
         // Started by hand with nothing to show would look like it had not started.
@@ -643,7 +651,7 @@ impl App {
     fn save_colors(&mut self) {
         self.saved_slots.written(self.slots);
         if let Err(e) = session::save_colors(&self.slots.into()) {
-            self.log(format!("保存颜色失败：{e}"));
+            self.log(tr!("log.save_colors_failed", e));
         }
     }
 
@@ -651,14 +659,14 @@ impl App {
         let result = session::save_layout(&layout);
         self.saved_layout.written(layout);
         if let Err(e) = result {
-            self.log(format!("保存窗口布局失败：{e}"));
+            self.log(tr!("log.save_layout_failed", e));
         }
     }
 
     fn save_settings(&mut self) {
-        self.saved_settings.written(self.settings);
+        self.saved_settings.written(self.settings.clone());
         if let Err(e) = session::save_settings(&self.settings) {
-            self.log(format!("保存设置失败：{e}"));
+            self.log(tr!("log.save_settings_failed", e));
         }
     }
 
@@ -670,7 +678,7 @@ impl App {
     }
 
     fn connect(&mut self, ctx: &egui::Context, pairing: Pairing, reconnect: bool) {
-        self.log(format!("连接 {:?}:{} ...", pairing.ips, pairing.port));
+        self.log(tr!("log.connecting", format!("{:?}", pairing.ips), pairing.port));
         self.link = Link::Connecting;
         let ctx = ctx.clone();
         self.worker = Some(Worker::spawn(pairing, reconnect, self.event_tx.clone(), move || {
@@ -707,12 +715,12 @@ impl App {
         }
         match result {
             ScanResult::Found(pairing) => {
-                self.log("在屏幕上找到了二维码");
+                self.log(tr!("log.code_found"));
                 self.connect(ctx, pairing, false);
             }
             ScanResult::NotFound => self.start_scan(ctx),
             ScanResult::Failed(e) => {
-                self.log(format!("截屏失败：{e}"));
+                self.log(tr!("log.capture_failed", e));
                 self.link = Link::Idle;
             }
         }
@@ -722,34 +730,34 @@ impl App {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::Connected { generation, saved } => {
-                    self.log(format!("已连接，协议版本 {generation}"));
+                    self.log(tr!("log.connected", generation));
                     session::log_connection("connected");
                     self.generation = generation;
                     self.link = Link::Connected;
                     if let Err(e) = session::save(&saved) {
-                        self.log(format!("保存会话失败：{e}"));
+                        self.log(tr!("log.save_session_failed", e));
                     }
                     self.saved = Some(saved);
                 }
                 Event::SessionInvalid => {
-                    self.log("保存的密码已失效，请重新扫描二维码");
+                    self.log(tr!("log.saved_password_stale"));
                     session::clear();
                     self.saved = None;
                     self.reset_link();
                 }
                 Event::Failed(reason) => {
-                    self.log(format!("连接失败：{reason}"));
+                    self.log(tr!("log.connect_failed", reason));
                     self.reset_link();
                 }
                 Event::Disconnected => {
-                    self.log("已断开");
+                    self.log(tr!("log.disconnected"));
                     session::log_connection("disconnected by user");
                     self.reset_link();
                 }
                 Event::Reconnecting(reason) => {
                     // Only the change of state: retries can go on for as long as CSP is closed.
                     if self.link != Link::Reconnecting {
-                        self.log(format!("正在重连：{reason}"));
+                        self.log(tr!("log.reconnecting", reason));
                         session::log_connection(&format!("dropped: {reason}"));
                     }
                     self.link = Link::Reconnecting;
@@ -765,15 +773,15 @@ impl App {
                     self.writes += 1;
                     if !accepted {
                         self.rejected += 1;
-                        self.log(format!("CSP 拒绝了 {}", to_hex(rgb)));
+                        self.log(tr!("log.color_refused", to_hex(rgb)));
                     }
                 }
                 Event::Blocked(blocked) => {
                     self.blocked = blocked;
                     self.log(if blocked {
-                        "CSP 暂不接受改色（正在画或有弹窗）"
+                        tr!("log.csp_blocked")
                     } else {
-                        "CSP 恢复接受改色"
+                        tr!("log.csp_unblocked")
                     });
                 }
                 Event::Foreground(in_front) => self.csp_in_front = in_front,
@@ -865,7 +873,7 @@ impl App {
         match click_csp_title_bar() {
             Ok(()) => self.last_restore = Some(Instant::now()),
             Err(platform::CSP_NOT_IN_FRONT) => {}
-            Err(reason) => self.log(format!("没有恢复 CSP：{reason}")),
+            Err(reason) => self.log(tr!("log.not_restored", i18n::text(reason))),
         }
     }
 
@@ -901,7 +909,7 @@ impl App {
         let end = left || std::mem::take(&mut lent.end_requested);
         if changed {
             if !platform::set_typing(hwnd, wants_keyboard) {
-                self.log("Windows 拒绝切换键盘焦点，请再点一次输入框");
+                self.log(tr!("log.focus_refused"));
             }
         }
         if end {
@@ -1370,7 +1378,7 @@ impl App {
             (Axis::Horizontal, false) => 2,
             (Axis::Horizontal, true) => 3,
         };
-        self.fold_icons[icon].show_hinted(ui, area, id, if folded { "展开" } else { "折叠" })
+        self.fold_icons[icon].show_hinted(ui, area, id, if folded { tr!("fold.unfold") } else { tr!("fold.fold") })
     }
 
     /// A folded stack that has been dragged away arrives unfolded, at its old size.
@@ -1760,14 +1768,14 @@ impl App {
         let ctx = ui.ctx().clone();
         match self.link {
             Link::Idle => {
-                ui.label("在 CSP 打开“文件 > 连接智能手机”后扫码。");
+                ui.label(tr!("connect.instructions"));
                 ui.horizontal(|ui| {
-                    if ui.button("扫描屏幕二维码").clicked() {
+                    if ui.button(tr!("connect.scan")).clicked() {
                         self.link = Link::Scanning;
                         self.start_scan(&ctx);
                     }
                     if let Some(saved) = self.saved.clone() {
-                        if ui.button("免扫码重连").clicked() {
+                        if ui.button(tr!("connect.reconnect")).clicked() {
                             self.connect(&ctx, saved, true);
                         }
                     }
@@ -1775,16 +1783,16 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.url_input)
-                            .hint_text("或粘贴二维码里的网址")
+                            .hint_text(tr!("connect.paste_hint"))
                             .desired_width(ui.available_width() - CONNECT_BUTTON_ROOM),
                     );
-                    if ui.button("连接").clicked() {
+                    if ui.button(tr!("connect.connect")).clicked() {
                         match parse_qr_url(&self.url_input) {
                             Some(pairing) => {
                                 self.url_input.clear();
                                 self.connect(&ctx, pairing, false);
                             }
-                            None => self.log("这个网址不是 CSP 的配对地址"),
+                            None => self.log(tr!("connect.bad_address")),
                         }
                     }
                 });
@@ -1792,8 +1800,8 @@ impl App {
             Link::Scanning => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("正在屏幕上查找二维码…");
-                    if ui.button("取消").clicked() {
+                    ui.label(tr!("connect.scanning"));
+                    if ui.button(tr!("action.cancel")).clicked() {
                         self.link = Link::Idle;
                     }
                 });
@@ -1801,14 +1809,14 @@ impl App {
             Link::Connecting => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("正在连接 CSP…");
+                    ui.label(tr!("connect.connecting"));
                 });
             }
             Link::Reconnecting => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("正在等待 CSP，会自动重连…");
-                    if ui.button("取消").clicked() {
+                    ui.label(tr!("connect.waiting"));
+                    if ui.button(tr!("action.cancel")).clicked() {
                         if let Some(worker) = &self.worker {
                             worker.send(Command::Disconnect);
                         }
@@ -1817,10 +1825,10 @@ impl App {
             }
             Link::Connected => {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("已连接").color(CONNECTED));
+                    ui.label(RichText::new(tr!("status.connected")).color(CONNECTED));
                     ui.label(&self.generation);
-                    ui.label(if self.csp_in_front { "CSP 在前台" } else { "CSP 在后台（低频同步）" });
-                    if ui.button("断开").clicked() {
+                    ui.label(if self.csp_in_front { tr!("connect.in_front") } else { tr!("connect.in_background") });
+                    if ui.button(tr!("connect.disconnect")).clicked() {
                         if let Some(worker) = &self.worker {
                             worker.send(Command::Disconnect);
                         }
@@ -1839,12 +1847,12 @@ impl App {
         let parts = slot_layout::arrange(ui.max_rect());
         // Where they overlap, the active one is on top.
         let (back, front) = if self.slots.active == Slot::Sub {
-            ((Slot::Main, parts.main, "前景色"), (Slot::Sub, parts.sub, "背景色"))
+            ((Slot::Main, parts.main, tr!("slot.main")), (Slot::Sub, parts.sub, tr!("slot.sub")))
         } else {
-            ((Slot::Sub, parts.sub, "背景色"), (Slot::Main, parts.main, "前景色"))
+            ((Slot::Sub, parts.sub, tr!("slot.sub")), (Slot::Main, parts.main, tr!("slot.main")))
         };
         let mut chosen = None;
-        for (slot, rect, name) in [back, front, (Slot::Transparent, parts.transparent, "透明色")] {
+        for (slot, rect, name) in [back, front, (Slot::Transparent, parts.transparent, tr!("slot.transparent"))] {
             if slot_chip(ui, rect, self.slots.color(slot), self.slots.active == slot, name) {
                 chosen = Some(slot);
             }
@@ -1875,7 +1883,7 @@ impl App {
         }
 
         let update_waiting = matches!(self.updater.state, update::State::Available(_));
-        let hover_text = if update_waiting { "设置（有新版本）" } else { "设置" };
+        let hover_text = if update_waiting { tr!("menu.settings_update") } else { tr!("menu.settings") };
         let mut button = ui.new_child(egui::UiBuilder::new().max_rect(parts.settings));
         if self.settings_icon.show(&mut button, self.settings_open, hover_text) {
             if self.settings_open {
@@ -1892,22 +1900,22 @@ impl App {
     /// Every text is the same length, so that the line never shifts.
     fn status(&self) -> (&'static str, Color32) {
         match self.link {
-            Link::Connected if self.blocked => ("已暂停", WARNING),
-            Link::Connected => ("已连接", CONNECTED),
-            Link::Reconnecting => ("重连中", WAITING),
-            Link::Connecting | Link::Scanning => ("连接中", WAITING),
-            Link::Idle => ("未连接", DISCONNECTED),
+            Link::Connected if self.blocked => (tr!("status.paused"), WARNING),
+            Link::Connected => (tr!("status.connected"), CONNECTED),
+            Link::Reconnecting => (tr!("status.retrying"), WAITING),
+            Link::Connecting | Link::Scanning => (tr!("status.connecting"), WAITING),
+            Link::Idle => (tr!("status.disconnected"), DISCONNECTED),
         }
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("连接 CSP").strong());
+        ui.label(RichText::new(tr!("connect.title")).strong());
         self.connection_ui(ui);
-        switch(ui, &mut self.settings.restore_csp, "抬笔后自动点击 CSP 标题栏")
-            .on_hover_text("修复用笔操作取色器后，数位板按键映射错误和笔刷光标卡住的问题");
+        switch(ui, &mut self.settings.restore_csp, tr!("restore.switch"))
+            .on_hover_text(tr!("restore.hint"));
         ui.separator();
 
-        ui.label(RichText::new("窗口").strong());
+        ui.label(RichText::new(tr!("menu.windows")).strong());
         for panel in PANELS {
             let open = self.windows.iter().filter(|window| window.open);
             let mut shown = open.flat_map(|window| window.node.panels()).any(|other| other == panel);
@@ -1917,30 +1925,45 @@ impl App {
         }
         ui.separator();
 
-        ui.label(RichText::new("后台").strong());
-        let hint = "开机后在后台运行一个没有界面的小进程，随 CSP 启动、最小化和关闭 Percepta";
-        if switch(ui, &mut self.settings.daemon, "跟随 CSP 启动、最小化和关闭").on_hover_text(hint).changed() {
+        ui.label(RichText::new(tr!("background.title")).strong());
+        let hint = tr!("background.hint");
+        if switch(ui, &mut self.settings.daemon, tr!("background.switch")).on_hover_text(hint).changed() {
             if let Err(e) = daemon::set_enabled(self.settings.daemon) {
-                self.log(format!("设置后台进程失败：{e}"));
+                self.log(tr!("log.daemon_set_failed", e));
             }
+        }
+        ui.separator();
+
+        ui.label(RichText::new(tr!("language.title")).strong());
+        let before = self.settings.language.clone();
+        let current = i18n::name_of(&before).unwrap_or(tr!("language.system"));
+        egui::ComboBox::from_id_salt("language").selected_text(current).show_ui(ui, |ui| {
+            ui.selectable_value(&mut self.settings.language, i18n::SYSTEM.to_owned(), tr!("language.system"));
+            for (code, name) in i18n::choices() {
+                ui.selectable_value(&mut self.settings.language, code.to_owned(), name);
+            }
+        });
+        if self.settings.language != before {
+            i18n::set(&self.settings.language);
+            install_fonts(ui.ctx());
         }
         ui.separator();
 
         ui.label(RichText::new("CMYK").strong());
         match self.picker.cmyk_profile_name() {
-            Some(name) => ui.label(format!("配置文件：{name}")),
-            None => ui.label(RichText::new("读不到 CSP 的配置文件，正在用通用公式换算").color(WARNING)),
+            Some(name) => ui.label(tr!("cmyk.profile", name)),
+            None => ui.label(RichText::new(tr!("cmyk.no_profile")).color(WARNING)),
         };
-        if ui.button("重新读取").on_hover_text("在 CSP 里改了配置文件后使用").clicked() {
+        if ui.button(tr!("cmyk.reload")).on_hover_text(tr!("cmyk.reload_hint")).clicked() {
             self.picker.reload_cmyk_profile();
         }
         ui.separator();
 
-        ui.label(RichText::new("更新").strong());
+        ui.label(RichText::new(tr!("update.title")).strong());
         self.update_ui(ui);
         ui.separator();
 
-        egui::CollapsingHeader::new("诊断").show(ui, |ui| {
+        egui::CollapsingHeader::new(tr!("diagnostics.title")).show(ui, |ui| {
             self.stats_ui(ui);
             egui::ScrollArea::vertical().max_height(LOG_HEIGHT).show(ui, |ui| {
                 // The exception: error messages are worth copying.
@@ -2016,7 +2039,7 @@ impl App {
             self.sync_csp_restore(ui.ctx());
             let frame = egui::Frame::central_panel(ui.style()).inner_margin(0.0);
             egui::CentralPanel::default().frame(frame).show(ui, |ui| {
-                let closed = title_bar(ui, "设置", &mut self.settings_close_icon);
+                let closed = title_bar(ui, tr!("menu.settings"), &mut self.settings_close_icon);
                 let content = ui.available_rect_before_wrap().shrink(CONTENT_MARGIN);
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(content));
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(&mut child, |ui| {
@@ -2032,51 +2055,51 @@ impl App {
 
     fn update_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        ui.label(format!("当前版本：{}", update::CURRENT_VERSION));
+        ui.label(tr!("update.current", update::CURRENT_VERSION));
         let mut install = None;
         let mut check = false;
         let mut ask_update = false;
         let mut cancel_update = false;
         match &self.updater.state {
-            update::State::Idle => check = ui.button("检查更新").clicked(),
+            update::State::Idle => check = ui.button(tr!("update.check")).clicked(),
             update::State::Checking => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("正在检查…");
+                    ui.label(tr!("update.checking"));
                 });
             }
             update::State::UpToDate => {
-                ui.label("已经是最新版本");
-                check = ui.button("检查更新").clicked();
+                ui.label(tr!("update.up_to_date"));
+                check = ui.button(tr!("update.check")).clicked();
             }
             update::State::Available(release) => {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(format!("有新版本 {}", release.version)).color(CONNECTED));
-                    ui.hyperlink_to("更新内容", &release.page);
+                    ui.label(RichText::new(tr!("update.available", release.version)).color(CONNECTED));
+                    ui.hyperlink_to(tr!("update.whats_new"), &release.page);
                 });
                 if self.confirm_update {
-                    ui.label("更新需要退出 Percepta，装好后会自动重新打开。");
+                    ui.label(tr!("update.confirm"));
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("退出并更新").clicked() {
+                        if ui.button(tr!("update.quit_and_update")).clicked() {
                             install = Some(release.clone());
                         }
-                        if ui.button("取消").clicked() {
+                        if ui.button(tr!("action.cancel")).clicked() {
                             cancel_update = true;
                         }
                     });
-                } else if ui.button("下载并安装").clicked() {
+                } else if ui.button(tr!("update.install")).clicked() {
                     ask_update = true;
                 }
             }
             update::State::Downloading(fraction) => {
-                ui.add(egui::ProgressBar::new(*fraction).text("正在下载…"));
+                ui.add(egui::ProgressBar::new(*fraction).text(tr!("update.downloading")));
             }
             update::State::Installing => {
-                ui.label("正在安装…");
+                ui.label(tr!("update.installing"));
             }
             update::State::Failed(reason) => {
                 ui.label(RichText::new(reason).color(WARNING));
-                check = ui.button("重新检查").clicked();
+                check = ui.button(tr!("update.check_again")).clicked();
             }
         }
         if check {
@@ -2086,19 +2109,14 @@ impl App {
         if let Some(release) = install {
             self.updater.install(&ctx, release);
         }
-        switch(ui, &mut self.settings.check_updates, "启动时检查更新").on_hover_text("只会联网询问 GitHub 有没有新版本");
+        switch(ui, &mut self.settings.check_updates, tr!("update.at_startup")).on_hover_text(tr!("update.at_startup_hint"));
     }
 
     fn stats_ui(&self, ui: &mut egui::Ui) {
         ui.ctx().request_repaint_after(STATS_REFRESH);
-        ui.label(format!(
-            "回读 {} 次/秒 · 平均 {:.1} ms · 最慢 {:.1} ms",
-            self.reads_per_second, self.read_ms, self.read_max_ms
-        ));
-        ui.label(format!(
-            "写入 {:.1} ms · 已写入 {} 次 · 被拒 {} 次",
-            self.write_ms, self.writes, self.rejected
-        ));
+        let ms = |value: f32| format!("{value:.1}");
+        ui.label(tr!("diagnostics.reads", self.reads_per_second, ms(self.read_ms), ms(self.read_max_ms)));
+        ui.label(tr!("diagnostics.writes", ms(self.write_ms), self.writes, self.rejected));
     }
 }
 
@@ -2228,11 +2246,11 @@ fn dragged_far_enough(ui: &egui::Ui, response: &egui::Response) -> bool {
         })
 }
 
-fn panel_name(panel: Panel) -> &'static str {
+pub fn panel_name(panel: Panel) -> &'static str {
     match panel {
-        Panel::Slots => "颜色",
-        Panel::Wheel => "色环",
-        Panel::Sliders => "滑块",
+        Panel::Slots => tr!("panel.colors"),
+        Panel::Wheel => tr!("panel.wheel"),
+        Panel::Sliders => tr!("panel.sliders"),
     }
 }
 
@@ -2312,16 +2330,31 @@ fn slot_chip(ui: &mut egui::Ui, outer: egui::Rect, rgb: Option<Rgb>, active: boo
     response.on_hover_text(name).clicked()
 }
 
-fn install_cjk_font(ctx: &egui::Context) {
-    let Some(data) = FONT_CANDIDATES.iter().find_map(|p| std::fs::read(p).ok()) else {
-        return;
+/// The fonts for the current language. Han characters look different in each of them, so its
+/// own font goes first. Latin text stays in egui's own.
+fn install_fonts(ctx: &egui::Context) {
+    let own: &[&str] = match i18n::current_code() {
+        "zh-TW" | "lzh" => &["msjh.ttc"],
+        "ja" => &[YU_GOTHIC, "meiryo.ttc"],
+        "ko" => &[HANGUL_FONT],
+        _ => &[],
     };
+    let read = |name: &str| std::fs::read(format!("{FONT_FOLDER}{name}")).ok().map(|data| (name.to_owned(), data));
+    let mut found: Vec<(String, Vec<u8>)> = own.iter().find_map(|name| read(name)).into_iter().collect();
+    found.extend(COMMON_FONTS.iter().find_map(|name| read(name)));
+    if own != [HANGUL_FONT] {
+        found.extend(read(HANGUL_FONT));
+    }
     let mut fonts = egui::FontDefinitions::default();
-    fonts
-        .font_data
-        .insert("cjk".into(), Arc::new(egui::FontData::from_owned(data)));
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts.families.entry(family).or_default().push("cjk".into());
+    for (name, data) in found {
+        let mut font = egui::FontData::from_owned(data);
+        if name == YU_GOTHIC {
+            font.index = YU_GOTHIC_UI_INDEX;
+        }
+        fonts.font_data.insert(name.clone(), Arc::new(font));
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push(name.clone());
+        }
     }
     ctx.set_fonts(fonts);
 }

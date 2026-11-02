@@ -1,5 +1,6 @@
 //! Win32 window behaviour: keeping keyboard focus in CSP, and spotting when CSP is in front.
 
+use crate::i18n::key;
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
@@ -52,7 +53,7 @@ static USE_SECOND_SPOT: AtomicBool = AtomicBool::new(false);
 static ALL_CLOSED: AtomicBool = AtomicBool::new(false);
 
 /// Why there was nothing to restore, as is normal while the user is in another program.
-pub const CSP_NOT_IN_FRONT: &str = "CSP 不在前台";
+pub const CSP_NOT_IN_FRONT: &str = key!("restore.not_in_front");
 const GUARD_SUBCLASS_ID: usize = 1;
 const HIT_TEST_TIMEOUT_MS: u32 = 50;
 /// A point this far in from the window's corner lies on its title bar.
@@ -799,7 +800,7 @@ fn title_bar_spot(window: HWND) -> Result<POINT, &'static str> {
         .get(second as usize)
         .or(spots.first())
         .copied()
-        .ok_or("标题栏没有可点击的空白处")
+        .ok_or(key!("restore.no_spot"))
 }
 
 fn click_title_bar(window: HWND) -> Result<(), &'static str> {
@@ -808,7 +809,7 @@ fn click_title_bar(window: HWND) -> Result<(), &'static str> {
     let mut cursor = POINT { x: 0, y: 0 };
     // SAFETY: `cursor` is valid for writes.
     if unsafe { GetCursorPos(&mut cursor) } == 0 {
-        return Err("读不到光标位置");
+        return Err(key!("restore.no_cursor"));
     }
     let events = [
         mouse_event(spot, 0),
@@ -822,7 +823,7 @@ fn click_title_bar(window: HWND) -> Result<(), &'static str> {
     if sent as usize == events.len() {
         Ok(())
     } else {
-        Err("系统拒绝了模拟点击")
+        Err(key!("restore.click_refused"))
     }
 }
 

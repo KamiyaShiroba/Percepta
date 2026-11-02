@@ -5,6 +5,7 @@ mod color;
 mod csp;
 mod daemon;
 mod frame;
+mod i18n;
 mod icc;
 mod layout;
 mod picker;

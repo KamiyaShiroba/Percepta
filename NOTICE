@@ -5,12 +5,13 @@ The Companion Mode wire format used by Percepta was documented by:
 - ok-picker-csp, MIT License, Copyright (c) 2026 luapwastaken
   https://github.com/luapwastaken/ok-picker-csp
 
-assets/settings.svg and assets/close.svg are from Tabler Icons, MIT License,
+assets/settings.svg, assets/close.svg and assets/chevron-*.svg are from Tabler Icons, MIT License,
 Copyright (c) 2020-2024 Paweł Kuna
 https://github.com/tabler/tabler-icons
 
 installer/ChineseSimplified.isl is from Inno Setup's source repository, by
-Zhenghan Yang (Kira), and is covered by the Inno Setup License
+Zhenghan Yang (Kira), and installer/ChineseTraditional.isl is from the same
+repository. Both are covered by the Inno Setup License
 https://github.com/jrsoftware/issrc
 
 Clip Studio Paint is a product of CELSYS, Inc. Percepta is not affiliated with

@@ -1,5 +1,6 @@
 //! Blocking request/reply connection to CSP.
 
+use crate::i18n::tr;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -38,14 +39,14 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Unreachable => write!(f, "连不上 CSP，请确认“连接智能手机”窗口已打开"),
-            Error::PasswordMismatch => write!(f, "密码已失效，请重新扫描二维码"),
-            Error::VersionMismatch => write!(f, "CSP 不接受这个协议版本"),
-            Error::ServerUnready => write!(f, "CSP 还没准备好，请关闭弹窗后重试"),
-            Error::AuthRejected(reason) => write!(f, "登录被拒绝：{reason}"),
-            Error::Timeout => write!(f, "等待 CSP 回复超时"),
-            Error::Closed => write!(f, "CSP 断开了连接"),
-            Error::Io(e) => write!(f, "网络错误：{e}"),
+            Error::Unreachable => f.write_str(tr!("error.unreachable")),
+            Error::PasswordMismatch => f.write_str(tr!("error.password")),
+            Error::VersionMismatch => f.write_str(tr!("error.version")),
+            Error::ServerUnready => f.write_str(tr!("error.unready")),
+            Error::AuthRejected(reason) => f.write_str(&tr!("error.auth", reason)),
+            Error::Timeout => f.write_str(tr!("error.timeout")),
+            Error::Closed => f.write_str(tr!("error.closed")),
+            Error::Io(e) => f.write_str(&tr!("error.network", e)),
         }
     }
 }

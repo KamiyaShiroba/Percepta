@@ -35,8 +35,11 @@ RestartApplications=no
 ; Setup follows the Windows display language. The first entry is the fallback.
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
-; Inno Setup's releases don't bundle this one yet: it comes from its source repository.
+; Inno Setup's releases don't bundle the two Chinese ones yet: they come from its source repository.
 Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
+Name: "chinesetraditional"; MessagesFile: "ChineseTraditional.isl"
+Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
+Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked

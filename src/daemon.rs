@@ -5,6 +5,7 @@
 //! It sleeps until something happens. Windows wakes it when the foreground changes, which a
 //! starting CSP causes, when a window is minimized or restored, and when CSP's process ends.
 
+use crate::i18n::tr;
 use std::collections::HashMap;
 use std::process::Command;
 use std::ptr;
@@ -62,7 +63,7 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
         )
     };
     if status != ERROR_SUCCESS {
-        return Err(format!("写入启动项失败（{status}）"));
+        return Err(tr!("log.startup_entry_failed", status));
     }
     if !is_running() {
         Command::new(exe).arg(ARGUMENT).spawn().map_err(|e| e.to_string())?;

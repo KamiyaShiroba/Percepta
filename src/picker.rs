@@ -1,6 +1,7 @@
 //! The colour wheel and slider panels. They are separate panels so that they can
 //! later be docked, tabbed and torn off independently.
 
+use crate::i18n::tr;
 use eframe::egui::{
     self, pos2, vec2, Color32, ColorImage, Mesh, Pos2, Rect, Response, Sense, Shape, Stroke,
     TextureHandle, TextureOptions, Vec2,
@@ -559,12 +560,12 @@ impl Picker {
         let size = ui.available_width().min(ui.available_height() - readout_room).max(MIN_WHEEL_SIZE);
         let mut changed = ui.vertical_centered(|ui| self.wheel(ui, color, size)).inner;
         if switch_line {
-            changed |= limit_switch(ui, color, "限制在 sRGB 内");
+            changed |= limit_switch(ui, color, tr!("picker.limit"));
         }
         ui.horizontal(|ui| {
             if oklch && !switch_line {
                 let roomy = ui.available_width() >= FULL_LIMIT_LABEL_WIDTH;
-                changed |= limit_switch(ui, color, if roomy { "限制在 sRGB 内" } else { "sRGB" });
+                changed |= limit_switch(ui, color, if roomy { tr!("picker.limit") } else { "sRGB" });
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 value_readout(ui, &value_parts(self.wheel_model, color.coords(self.wheel_model)));
@@ -629,7 +630,7 @@ impl Picker {
             ui.add_space(gap);
             let line = vec2(ui.available_width(), SLIDER_HEIGHT);
             let layout = egui::Layout::left_to_right(egui::Align::Center);
-            changed |= ui.allocate_ui_with_layout(line, layout, |ui| limit_switch(ui, color, "限制在 sRGB 内")).inner;
+            changed |= ui.allocate_ui_with_layout(line, layout, |ui| limit_switch(ui, color, tr!("picker.limit"))).inner;
         }
         changed
     }
@@ -851,7 +852,7 @@ impl Picker {
 
 fn limit_switch(ui: &mut egui::Ui, color: &mut ColorState, label: &str) -> bool {
     let changed = switch(ui, &mut color.limit_to_srgb, label)
-        .on_hover_text("把 OKLCH 限制在 sRGB 色域内")
+        .on_hover_text(tr!("picker.limit_hint"))
         .changed();
     if changed {
         color.set(Model::Oklch, color.coords(Model::Oklch));

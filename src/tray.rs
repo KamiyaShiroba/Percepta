@@ -7,6 +7,8 @@ use std::sync::OnceLock;
 
 use eframe::egui;
 use windows_sys::core::{w, PCWSTR};
+use crate::app::panel_name;
+use crate::i18n::tr;
 use crate::layout::{Panel, PANELS};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -228,6 +230,11 @@ fn add_icon(hwnd: HWND, icon: HICON) {
     unsafe { Shell_NotifyIconW(NIM_ADD, &data) };
 }
 
+/// For one call: AppendMenuW keeps its own copy.
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain([0]).collect()
+}
+
 /// Opens the menu at the cursor, or at `at` for a window's own button.
 fn show_menu(hwnd: HWND, at: Option<POINT>) {
     // Tray menus only close properly when clicking away if their window is in front, and
@@ -236,17 +243,17 @@ fn show_menu(hwnd: HWND, at: Option<POINT>) {
     unsafe {
         let previous = GetForegroundWindow();
         let menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w!("窗口"));
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, wide(tr!("menu.windows")).as_ptr());
         let shown = SHOWN_PANELS.load(Ordering::Relaxed);
-        for (index, name) in [w!("颜色"), w!("色环"), w!("滑块")].into_iter().enumerate() {
+        for (index, &panel) in PANELS.iter().enumerate() {
             let check = if shown & 1 << index != 0 { MF_CHECKED } else { 0 };
-            AppendMenuW(menu, MF_STRING | check, MENU_FIRST_PANEL + index, name);
+            AppendMenuW(menu, MF_STRING | check, MENU_FIRST_PANEL + index, wide(panel_name(panel)).as_ptr());
         }
-        AppendMenuW(menu, MF_STRING, MENU_SHOW, w!("显示全部"));
+        AppendMenuW(menu, MF_STRING, MENU_SHOW, wide(tr!("menu.show_all")).as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-        AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("设置"));
+        AppendMenuW(menu, MF_STRING, MENU_SETTINGS, wide(tr!("menu.settings")).as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-        AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("退出 Percepta"));
+        AppendMenuW(menu, MF_STRING, MENU_QUIT, wide(tr!("menu.quit")).as_ptr());
         let mut cursor = POINT { x: 0, y: 0 };
         GetCursorPos(&mut cursor);
         let point = at.unwrap_or(cursor);
@@ -284,7 +291,7 @@ fn show_flexible_menu(hwnd: HWND, point: POINT) {
         let previous = GetForegroundWindow();
         let menu = CreatePopupMenu();
         let check = if FLEXIBLE_CHECKED.load(Ordering::Relaxed) { MF_CHECKED } else { 0 };
-        AppendMenuW(menu, MF_STRING | check, MENU_FLEXIBLE, w!("随窗口伸缩"));
+        AppendMenuW(menu, MF_STRING | check, MENU_FLEXIBLE, wide(tr!("menu.flexible")).as_ptr());
         SetForegroundWindow(hwnd);
         let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, ptr::null()) as usize;
         PostMessageW(hwnd, WM_NULL, 0, 0);

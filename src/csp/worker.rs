@@ -1,5 +1,6 @@
 //! Owns the connection on its own thread so the UI never waits on the network.
 
+use crate::i18n::tr;
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -197,7 +198,7 @@ fn apply_write(
             if client.select_slot(slots, slot)? {
                 slots.active = slot;
             } else {
-                emit(Event::Log("切换颜色槽位失败：CSP 拒绝了，或还没读到这个槽位的颜色".into()));
+                emit(Event::Log(tr!("log.slot_failed").into()));
             }
         }
     }
@@ -294,7 +295,7 @@ fn run(
                 }
                 None => {
                     if !was_empty {
-                        emit(Event::Log("CSP 返回了空状态，发送唤醒心跳".into()));
+                        emit(Event::Log(tr!("log.empty_state").into()));
                     }
                     was_empty = true;
                     client.wake()?;
