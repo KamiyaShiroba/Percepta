@@ -45,7 +45,7 @@ const BASE_DPI: f32 = 96.0;
 const SUBCLASS_ID: usize = 2;
 /// Not among the window messages that windows-sys lists with the others.
 const WM_MOUSELEAVE: u32 = 0x02A3;
-/// Passes `caption_left` to the window's frame, in `wparam`.
+/// Passes `caption_left` and `caption_right` to the window's frame, in `wparam` and `lparam`.
 const WM_SET_CAPTION_LEFT: u32 = WM_APP + 16;
 /// How opaque a window is while it is being dragged.
 const DRAGGED_ALPHA: u8 = 170;
@@ -70,8 +70,10 @@ enum Zone {
 }
 
 /// `caption_left` is where the part of the title bar that drags the window begins, at 100%
-/// scale. Anything to its left is for the UI, such as tabs.
-fn zone_at(x: f32, y: f32, width: f32, height: f32, scale: f32, resizable: bool, caption_left: f32) -> Zone {
+/// scale, and `caption_right` how far from the right it ends. What is outside it is for the UI,
+/// such as tabs and buttons.
+#[allow(clippy::too_many_arguments)]
+fn zone_at(x: f32, y: f32, width: f32, height: f32, scale: f32, resizable: bool, caption_left: f32, caption_right: f32) -> Zone {
     let border = RESIZE_BORDER * scale;
     if resizable {
         let (left, right) = (x < border, x >= width - border);
@@ -88,7 +90,7 @@ fn zone_at(x: f32, y: f32, width: f32, height: f32, scale: f32, resizable: bool,
             _ => {}
         }
     }
-    if y < TITLE_BAR_HEIGHT * scale && x >= caption_left * scale && x < width - TITLE_BUTTON_WIDTH * scale {
+    if y < TITLE_BAR_HEIGHT * scale && x >= caption_left * scale && x < width - caption_right * scale {
         Zone::Caption
     } else {
         Zone::Client
@@ -115,6 +117,7 @@ struct FrameState {
     move_start: RECT,
     cursor_start: POINT,
     caption_left: f32,
+    caption_right: f32,
     /// The scale winit knows about, which lags the real one during a drag.
     applied_dpi: u32,
 }
@@ -134,6 +137,7 @@ pub fn install(hwnd: HWND, resizable: bool, shadow_allowed: fn(HWND) -> bool) {
         move_start: RECT { left: 0, top: 0, right: 0, bottom: 0 },
         cursor_start: POINT { x: 0, y: 0 },
         caption_left: 0.0,
+        caption_right: TITLE_BUTTON_WIDTH,
         // SAFETY: takes no pointers, and a stale handle reads as 0.
         applied_dpi: unsafe { GetDpiForWindow(hwnd) },
     });
@@ -181,10 +185,10 @@ pub fn window_origin(hwnd: HWND) -> [i32; 2] {
     [rect.left, rect.top]
 }
 
-/// Leaves the title bar to the left of `caption_left` to the UI.
-pub fn set_caption_left(hwnd: HWND, caption_left: f32) {
+/// Leaves the title bar outside `caption_left` and `caption_right` to the UI.
+pub fn set_caption(hwnd: HWND, caption_left: f32, caption_right: f32) {
     // SAFETY: a message that `frame_proc` handles, and a stale handle only fails.
-    unsafe { SendMessageW(hwnd, WM_SET_CAPTION_LEFT, caption_left.ceil() as WPARAM, 0) };
+    unsafe { SendMessageW(hwnd, WM_SET_CAPTION_LEFT, caption_left.ceil() as WPARAM, caption_right.ceil() as LPARAM) };
 }
 
 /// Hides or shows a window on screen, while Windows and eframe still count it as visible.
@@ -246,6 +250,7 @@ unsafe extern "system" fn frame_proc(
         }
         WM_SET_CAPTION_LEFT => {
             state.caption_left = wparam as f32;
+            state.caption_right = lparam as f32;
             return 0;
         }
         WM_SIZING => state.sizing = true,
@@ -314,6 +319,7 @@ unsafe extern "system" fn frame_proc(
                 scale_of(hwnd),
                 state.resizable,
                 state.caption_left,
+                state.caption_right,
             );
             match zone {
                 Zone::Caption => return HTCAPTION as LRESULT,
@@ -671,7 +677,7 @@ mod tests {
     const SCALE: f32 = 1.5;
 
     fn zone(x: f32, y: f32) -> Zone {
-        zone_at(x, y, W, H, SCALE, true, 0.0)
+        zone_at(x, y, W, H, SCALE, true, 0.0, TITLE_BUTTON_WIDTH)
     }
 
     #[test]
@@ -695,8 +701,8 @@ mod tests {
     #[test]
     fn tabs_at_the_left_of_the_title_bar_are_left_to_the_ui() {
         // Tabs of 100 at 1.5x, below the 6 pixels of the top edge.
-        assert_eq!(zone_at(149.0, 15.0, W, H, SCALE, true, 100.0), Zone::Client);
-        assert_eq!(zone_at(151.0, 15.0, W, H, SCALE, true, 100.0), Zone::Caption);
+        assert_eq!(zone_at(149.0, 15.0, W, H, SCALE, true, 100.0, TITLE_BUTTON_WIDTH), Zone::Client);
+        assert_eq!(zone_at(151.0, 15.0, W, H, SCALE, true, 100.0, TITLE_BUTTON_WIDTH), Zone::Caption);
     }
 
     #[test]
@@ -711,8 +717,8 @@ mod tests {
 
     #[test]
     fn a_fixed_window_has_no_resize_edges() {
-        assert_eq!(zone_at(0.0, 300.0, W, H, SCALE, false, 0.0), Zone::Client);
-        assert_eq!(zone_at(300.0, 0.0, W, H, SCALE, false, 0.0), Zone::Caption);
+        assert_eq!(zone_at(0.0, 300.0, W, H, SCALE, false, 0.0, TITLE_BUTTON_WIDTH), Zone::Client);
+        assert_eq!(zone_at(300.0, 0.0, W, H, SCALE, false, 0.0, TITLE_BUTTON_WIDTH), Zone::Caption);
     }
 
     #[test]

@@ -75,7 +75,7 @@ cargo build --release
 
 - [clipremote](https://github.com/chocolatkey/clipremote) 和 [ok-picker-csp](https://github.com/luapwastaken/ok-picker-csp)：没有前人摸清协议，这个项目连第一步都迈不出去。
 - [Björn Ottosson](https://bottosson.github.io/posts/oklab/)：发明了 Oklab，是这一切的起点。
-- [Tabler Icons](https://github.com/tabler/tabler-icons)：设置按钮的小齿轮和关闭按钮的叉。
+- [Tabler Icons](https://github.com/tabler/tabler-icons)：设置按钮的小齿轮、关闭按钮的叉和折叠按钮的箭头。
 
 详细的来源和许可证信息见 [NOTICE](NOTICE)。
 

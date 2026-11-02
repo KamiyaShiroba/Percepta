@@ -14,6 +14,12 @@ pub const MODULE_TITLE_HEIGHT: f32 = 20.0;
 pub const SLOTS_SQUARE_MIN_HEIGHT: f32 = 200.0;
 /// When they are alone in a window, and from `SLOTS_SQUARE_MIN_HEIGHT` on.
 pub const SLOTS_NARROWEST: f32 = 50.0;
+/// What is left of a folded stack along the axis it folded: a title strip that runs across a
+/// column, or a narrow strip with its name written downwards in a row.
+pub const FOLDED_HEIGHT: f32 = MODULE_TITLE_HEIGHT;
+pub const FOLDED_WIDTH: f32 = 24.0;
+/// That strip's height, enough for a name and the button that unfolds it.
+const FOLDED_STRIP_MIN_HEIGHT: f32 = 60.0;
 /// The colour slots, the wheel and the sliders, as the order that `Node::stack` puts them in.
 /// All with their title strips.
 pub const MIN_HEIGHTS: [f32; 3] = [80.0, 220.0, 170.0];
@@ -84,6 +90,66 @@ pub struct Home {
     pub size: Option<f32>,
 }
 
+/// Which module in a window takes what the window gains when the user makes it bigger, and
+/// gives way first when they make it smaller. Nothing else ever grows by itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum Flexible {
+    /// The wheel, the one module that can make use of the room, or else the last one.
+    #[default]
+    Auto,
+    Panel(Panel),
+    /// None of them: what the window gains stays empty.
+    Nothing,
+}
+
+impl Flexible {
+    /// The module this comes down to in a window holding `node`.
+    pub fn of(self, node: &Node) -> Option<Panel> {
+        let panels = node.panels();
+        match self {
+            Flexible::Auto if panels.contains(&Panel::Wheel) => Some(Panel::Wheel),
+            Flexible::Auto => panels.last().copied(),
+            Flexible::Panel(panel) => Some(panel),
+            Flexible::Nothing => None,
+        }
+    }
+
+    /// A choice of a module that has since left the window goes back to the default.
+    pub fn settled(self, node: &Node) -> Self {
+        match self {
+            Flexible::Panel(panel) if !node.panels().contains(&panel) => Flexible::Auto,
+            flexible => flexible,
+        }
+    }
+
+    /// Which of `children` takes the room, `except` one. Where the module isn't among them,
+    /// which happens in the rows and columns beside it, the last one fills what is left.
+    fn taker(self, children: &[Child], except: Option<usize>) -> Option<usize> {
+        let target = match self {
+            Flexible::Auto => Panel::Wheel,
+            Flexible::Panel(panel) => panel,
+            Flexible::Nothing => return None,
+        };
+        let open = |index: &usize| Some(*index) != except && !children[*index].node.is_folded();
+        let holding = |index: &usize| children[*index].node.panels().contains(&target);
+        (0..children.len()).filter(open).find(|index| holding(index)).or_else(|| (0..children.len()).rev().find(open))
+    }
+}
+
+/// A stack folded along `axis`, and the length it had there, to go back to.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Fold {
+    pub axis: Axis,
+    pub length: f32,
+}
+
+fn folded_length(axis: Axis) -> f32 {
+    match axis {
+        Axis::Horizontal => FOLDED_WIDTH,
+        Axis::Vertical => FOLDED_HEIGHT,
+    }
+}
+
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Child {
     pub node: Node,
@@ -91,9 +157,24 @@ pub struct Child {
     pub size: f32,
 }
 
+impl Child {
+    /// Its length when not folded.
+    fn open_size(&self) -> f32 {
+        match self.node {
+            Node::Tabs { fold: Some(fold), .. } => fold.length,
+            _ => self.size,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Node {
-    Tabs { panels: Vec<Panel>, active: usize },
+    Tabs {
+        panels: Vec<Panel>,
+        active: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fold: Option<Fold>,
+    },
     Split { axis: Axis, children: Vec<Child> },
 }
 
@@ -107,14 +188,14 @@ impl Node {
     /// The arrangement there has always been: the panels above one another.
     pub fn stack(heights: [f32; 3]) -> Self {
         let children = PANELS.iter().zip(heights).map(|(&panel, size)| Child {
-            node: Node::Tabs { panels: vec![panel], active: 0 },
+            node: Node::Tabs { panels: vec![panel], active: 0, fold: None },
             size,
         });
         Node::Split { axis: Axis::Vertical, children: children.collect() }
     }
 
     pub fn tabs(panels: Vec<Panel>) -> Self {
-        Node::Tabs { panels, active: 0 }
+        Node::Tabs { panels, active: 0, fold: None }
     }
 
     /// Every panel in the node.
@@ -129,7 +210,7 @@ impl Node {
     /// that is left keeps its length. The node must hold something else.
     pub fn lift(&mut self, panel: Panel) -> [f32; 2] {
         match self {
-            Node::Tabs { panels, active } => {
+            Node::Tabs { panels, active, .. } => {
                 if let Some(index) = panels.iter().position(|&other| other == panel) {
                     panels.remove(index);
                     if *active > index || *active >= panels.len() {
@@ -183,7 +264,7 @@ impl Node {
                 if children[index].node.panels().len() > 1 {
                     return children[index].node.home(panel);
                 }
-                let size = Some(children[index].size);
+                let size = Some(children[index].open_size());
                 // Beside all of a nested split, not one of the stacks in it.
                 let home = |child: &Child, beside, before| {
                     let drop = match child.node {
@@ -283,7 +364,7 @@ impl Node {
         }
         match drop {
             Drop::Tab(index) => {
-                if let Some(Node::Tabs { panels: tabs, active }) = self.stack_mut(target) {
+                if let Some(Node::Tabs { panels: tabs, active, .. }) = self.stack_mut(target) {
                     let index = index.min(tabs.len());
                     *active = index;
                     tabs.splice(index..index, panels);
@@ -331,6 +412,9 @@ impl Node {
     /// not made room yet. The window never changes size by itself on the way.
     pub fn min_at(&self, [width, height]: [f32; 2]) -> [f32; 2] {
         let [min_width, min_height] = [self.min_size(Axis::Horizontal), self.min_size(Axis::Vertical)];
+        if self.is_folded() {
+            return [min_width.min(width).max(SLOTS_NARROWEST), min_height];
+        }
         if !matches!(self, Node::Tabs { panels, .. } if panels[..] == [Panel::Slots]) {
             return [min_width, min_height];
         }
@@ -342,6 +426,8 @@ impl Node {
 
     pub fn min_size(&self, axis: Axis) -> f32 {
         match self {
+            Node::Tabs { fold: Some(fold), .. } if fold.axis == axis => folded_length(axis),
+            Node::Tabs { fold: Some(_), .. } if axis == Axis::Vertical => FOLDED_STRIP_MIN_HEIGHT,
             Node::Tabs { panels, .. } => panels.iter().map(|panel| panel.min_size(axis)).fold(0.0, f32::max),
             Node::Split { axis: along, children } => {
                 let sizes = children.iter().map(|child| child.node.min_size(axis));
@@ -350,10 +436,95 @@ impl Node {
         }
     }
 
+    pub fn is_folded(&self) -> bool {
+        matches!(self, Node::Tabs { fold: Some(_), .. })
+    }
+
+    /// How long a window can usefully be along `axis`, if all of this has folded along it.
+    pub fn max_length(&self, axis: Axis) -> Option<f32> {
+        match self {
+            Node::Tabs { fold: Some(fold), .. } if fold.axis == axis => Some(folded_length(axis)),
+            Node::Tabs { .. } => None,
+            Node::Split { axis: along, children } => {
+                let lengths = children.iter().map(|child| child.node.max_length(axis)).collect::<Option<Vec<f32>>>()?;
+                Some(if *along == axis { lengths.iter().sum() } else { lengths.iter().copied().fold(0.0, f32::max) })
+            }
+        }
+    }
+
+    /// Folds or unfolds the stack that holds `panel`, and returns how much the window should
+    /// change along each axis. `room` is the area this node fills at the moment. In a split at
+    /// the top of the window, the others keep their lengths and the window changes. Further in,
+    /// it would change the modules beside the split too, so the neighbours make up for it.
+    pub fn toggle_fold(&mut self, panel: Panel, room: [f32; 2]) -> [f32; 2] {
+        self.toggle_fold_at(panel, room, true)
+    }
+
+    fn toggle_fold_at(&mut self, panel: Panel, room: [f32; 2], top: bool) -> [f32; 2] {
+        match self {
+            Node::Tabs { panels, fold, .. } => {
+                if !panels.contains(&panel) {
+                    return [0.0, 0.0];
+                }
+                let height = room[Axis::Vertical.index()];
+                let new = match fold.take() {
+                    Some(fold) => fold.length,
+                    None => {
+                        *fold = Some(Fold { axis: Axis::Vertical, length: height });
+                        FOLDED_HEIGHT
+                    }
+                };
+                [0.0, new - height]
+            }
+            Node::Split { axis, children } => {
+                let axis = *axis;
+                let Some(index) = children.iter().position(|child| child.node.panels().contains(&panel)) else {
+                    return [0.0, 0.0];
+                };
+                let old = children[index].size;
+                let Node::Tabs { fold, .. } = &mut children[index].node else {
+                    return children[index].node.toggle_fold_at(panel, room, false);
+                };
+                let new = match fold.take() {
+                    Some(fold) => fold.length,
+                    None => {
+                        *fold = Some(Fold { axis, length: old });
+                        folded_length(axis)
+                    }
+                };
+                children[index].size = new;
+                let mut change = [0.0, 0.0];
+                if top {
+                    change[axis.index()] = new - old;
+                } else {
+                    make_up_for(children, axis, index, new - old);
+                }
+                change
+            }
+        }
+    }
+
+    /// A stack stops being folded when it ends up where it can't be, like in a row after
+    /// folding in a column. `along` is the axis of what holds this.
+    pub fn settle_folds(&mut self, along: Axis) {
+        match self {
+            Node::Tabs { fold, .. } => {
+                if fold.is_some_and(|fold| fold.axis != along) {
+                    *fold = None;
+                }
+            }
+            Node::Split { axis, children } => {
+                for child in children {
+                    child.node.settle_folds(*axis);
+                }
+            }
+        }
+    }
+
     /// Makes everything in the node fill `width` by `height`. In each split, spare room goes
-    /// to the last child, and a shortage comes from the last child first, as far as the
-    /// minimum sizes allow.
-    pub fn fit(&mut self, width: f32, height: f32) {
+    /// to the child that `flexible` picks, and a shortage comes from it first and then from the
+    /// last child, as far as the minimum sizes allow.
+    pub fn fit(&mut self, width: f32, height: f32, flexible: Flexible) {
         let Node::Split { axis, children } = self else { return };
         let (total, across) = match axis {
             Axis::Horizontal => (width, height),
@@ -362,24 +533,25 @@ impl Node {
         let axis = *axis;
         let mins: Vec<f32> = children.iter().map(|child| child.node.min_size(axis)).collect();
         for (child, min) in children.iter_mut().zip(&mins) {
-            child.size = child.size.max(*min);
+            child.size = if child.node.is_folded() { *min } else { child.size.max(*min) };
         }
         let mut spare = total - children.iter().map(|child| child.size).sum::<f32>();
         if spare >= 0.0 {
-            if let Some(last) = children.last_mut() {
-                last.size += spare;
+            if let Some(taker) = flexible.taker(children, None) {
+                children[taker].size += spare;
             }
         } else {
-            for (child, min) in children.iter_mut().zip(&mins).rev() {
-                let taken = (child.size - min).min(-spare);
-                child.size -= taken;
+            let first = flexible.taker(children, None);
+            for index in first.into_iter().chain((0..children.len()).rev()) {
+                let taken = (children[index].size - mins[index]).clamp(0.0, -spare);
+                children[index].size -= taken;
                 spare += taken;
             }
         }
         for child in children {
             match axis {
-                Axis::Horizontal => child.node.fit(child.size, across),
-                Axis::Vertical => child.node.fit(across, child.size),
+                Axis::Horizontal => child.node.fit(child.size, across, flexible),
+                Axis::Vertical => child.node.fit(across, child.size, flexible),
             }
         }
     }
@@ -405,6 +577,24 @@ impl Node {
             _ => None,
         }
     }
+}
+
+/// Has the other children absorb `children[index]` changing by `change`.
+fn make_up_for(children: &mut [Child], axis: Axis, index: usize, change: f32) {
+    let others = (0..children.len()).rev().filter(|&other| other != index && !children[other].node.is_folded());
+    if change < 0.0 {
+        if let Some(other) = others.collect::<Vec<_>>().first() {
+            children[*other].size -= change;
+        }
+        return;
+    }
+    let mut needed = change;
+    for other in others.collect::<Vec<_>>() {
+        let taken = (children[other].size - children[other].node.min_size(axis)).clamp(0.0, needed);
+        children[other].size -= taken;
+        needed -= taken;
+    }
+    children[index].size -= needed;
 }
 
 /// A node as children of a split along `axis`: its own, if it is such a split itself.
@@ -436,25 +626,43 @@ pub fn is_complete(nodes: &[&Node], hidden: &[Panel]) -> bool {
 }
 
 /// Applies dragging the line after `children[line]` by `delta`, along `axis`, and returns by
-/// how much the window should grow. A child that grows makes the window bigger, while one
-/// that shrinks hands its room to the last child and leaves the window as it is.
-pub fn drag_line(children: &mut [Child], axis: Axis, line: usize, delta: f32) -> f32 {
+/// how much the window should grow. `total` is the length the children have to fill. A child
+/// that shrinks hands its room to the child that `flexible` picks and leaves the window as it
+/// is. One that grows takes room back the same way, from what is empty and then from that
+/// child, so that dragging to and fro leaves the window alone, and only what is still missing
+/// makes the window bigger. A folded child stays as it is.
+pub fn drag_line(children: &mut [Child], axis: Axis, line: usize, delta: f32, flexible: Flexible, total: f32) -> f32 {
+    if children[line].node.is_folded() {
+        return 0.0;
+    }
     let min = children[line].node.min_size(axis);
     let new_size = (children[line].size + delta).max(min);
     let change = new_size - children[line].size;
+    let taker = flexible.taker(children, Some(line));
+    if change < 0.0 {
+        children[line].size = new_size;
+        if let Some(taker) = taker {
+            children[taker].size -= change;
+        }
+        return 0.0;
+    }
+    let empty = (total - children.iter().map(|child| child.size).sum::<f32>()).max(0.0);
+    let mut missing = (change - empty).max(0.0);
+    if let Some(taker) = taker {
+        let taken = (children[taker].size - children[taker].node.min_size(axis)).clamp(0.0, missing);
+        children[taker].size -= taken;
+        missing -= taken;
+    }
     children[line].size = new_size;
-    if change >= 0.0 {
-        return change;
-    }
-    if let Some(last) = children.last_mut() {
-        last.size -= change;
-    }
-    0.0
+    missing
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What most of these are about doesn't depend on which module takes the room.
+    const SLIDERS: Flexible = Flexible::Panel(Panel::Sliders);
 
     fn heights(node: &Node) -> Vec<f32> {
         match node {
@@ -465,7 +673,7 @@ mod tests {
 
     fn fitted(start: [f32; 3], total: f32) -> Vec<f32> {
         let mut node = Node::stack(start);
-        node.fit(380.0, total);
+        node.fit(380.0, total, SLIDERS);
         heights(&node)
     }
 
@@ -483,16 +691,33 @@ mod tests {
     fn dragged(line: usize, delta: f32) -> (Vec<f32>, f32) {
         let mut node = Node::stack([92.0, 360.0, 228.0]);
         let Node::Split { children, .. } = &mut node else { unreachable!() };
-        let grow = drag_line(children, Axis::Vertical, line, delta);
+        let grow = drag_line(children, Axis::Vertical, line, delta, SLIDERS, 680.0);
         (heights(&node), grow)
     }
 
     #[test]
-    fn growing_a_panel_grows_the_window_but_shrinking_one_does_not() {
-        assert_eq!(dragged(1, 30.0), (vec![92.0, 390.0, 228.0], 30.0));
+    fn growing_a_panel_takes_what_it_can_and_only_then_grows_the_window() {
+        assert_eq!(dragged(1, 30.0), (vec![92.0, 390.0, 198.0], 0.0));
+        assert_eq!(dragged(1, 100.0), (vec![92.0, 460.0, 170.0], 42.0));
         assert_eq!(dragged(1, -30.0), (vec![92.0, 330.0, 258.0], 0.0));
         // Stops at the minimum, and the rest of the drag does nothing.
         assert_eq!(dragged(0, -30.0), (vec![80.0, 360.0, 240.0], 0.0));
+    }
+
+    #[test]
+    fn dragging_a_line_to_and_fro_does_not_make_the_window_any_bigger() {
+        for flexible in [Flexible::Auto, Flexible::Panel(Panel::Slots), SLIDERS, Flexible::Nothing] {
+            let mut node = Node::stack([92.0, 360.0, 170.0]);
+            let Node::Split { children, .. } = &mut node else { unreachable!() };
+            let mut total = 622.0;
+            total += drag_line(children, Axis::Vertical, 1, 80.0, flexible, total);
+            let after_first = total;
+            for _ in 0..5 {
+                total += drag_line(children, Axis::Vertical, 1, -80.0, flexible, total);
+                total += drag_line(children, Axis::Vertical, 1, 80.0, flexible, total);
+            }
+            assert_eq!(total, after_first, "{flexible:?}");
+        }
     }
 
     #[test]
@@ -524,11 +749,11 @@ mod tests {
 
     #[test]
     fn removing_a_tab_keeps_the_stack_and_a_valid_active_tab() {
-        let mut node = Node::Tabs { panels: PANELS.to_vec(), active: 2 };
+        let mut node = Node::Tabs { panels: PANELS.to_vec(), active: 2, fold: None };
         node.lift(Panel::Sliders);
-        assert_eq!(node, Node::Tabs { panels: vec![Panel::Slots, Panel::Wheel], active: 1 });
+        assert_eq!(node, Node::Tabs { panels: vec![Panel::Slots, Panel::Wheel], active: 1, fold: None });
         node.lift(Panel::Slots);
-        assert_eq!(node, Node::Tabs { panels: vec![Panel::Wheel], active: 0 });
+        assert_eq!(node, Node::Tabs { panels: vec![Panel::Wheel], active: 0, fold: None });
     }
 
     #[test]
@@ -557,11 +782,11 @@ mod tests {
     fn a_tab_lands_where_it_was_aimed_and_becomes_the_active_one() {
         let mut node = Node::tabs(vec![Panel::Slots, Panel::Sliders]);
         node.dock(Panel::Slots, Drop::Tab(1), vec![Panel::Wheel]);
-        assert_eq!(node, Node::Tabs { panels: PANELS.to_vec(), active: 1 });
+        assert_eq!(node, Node::Tabs { panels: PANELS.to_vec(), active: 1, fold: None });
 
         let mut first = Node::tabs(vec![Panel::Wheel]);
         first.dock(Panel::Wheel, Drop::Tab(0), vec![Panel::Slots]);
-        assert_eq!(first, Node::Tabs { panels: vec![Panel::Slots, Panel::Wheel], active: 0 });
+        assert_eq!(first, Node::Tabs { panels: vec![Panel::Slots, Panel::Wheel], active: 0, fold: None });
     }
 
     #[test]
@@ -580,7 +805,7 @@ mod tests {
 
     /// The wheel beside the slots and sliders, which sit above one another.
     fn nested() -> Node {
-        let tabs = |panel| Node::Tabs { panels: vec![panel], active: 0 };
+        let tabs = |panel| Node::Tabs { panels: vec![panel], active: 0, fold: None };
         Node::Split {
             axis: Axis::Horizontal,
             children: vec![
@@ -676,7 +901,7 @@ mod tests {
         assert_eq!(node.min_size(Axis::Horizontal), 410.0);
         // The taller of the wheel, and the slots and sliders together.
         assert_eq!(node.min_size(Axis::Vertical), 250.0);
-        node.fit(800.0, 500.0);
+        node.fit(800.0, 500.0, SLIDERS);
         assert_eq!(heights(&node), [300.0, 500.0]);
         let Node::Split { children, .. } = &node else { unreachable!() };
         assert_eq!(heights(&children[1].node), [100.0, 400.0]);
@@ -694,6 +919,149 @@ mod tests {
     }
 
     #[test]
+    fn folding_in_a_top_split_changes_the_window_and_unfolding_brings_it_back() {
+        let mut node = Node::stack([92.0, 360.0, 228.0]);
+        let room = [570.0, 680.0];
+        assert_eq!(node.toggle_fold(Panel::Wheel, room), [0.0, -340.0]);
+        assert_eq!(heights(&node), [92.0, 20.0, 228.0]);
+        // Only the others take part in the room a window is given.
+        node.fit(570.0, 500.0, SLIDERS);
+        assert_eq!(heights(&node), [92.0, 20.0, 388.0]);
+        node.fit(570.0, 340.0, SLIDERS);
+        assert_eq!(heights(&node), [92.0, 20.0, 228.0]);
+        assert_eq!(node.toggle_fold(Panel::Wheel, [570.0, 340.0]), [0.0, 340.0]);
+        assert_eq!(heights(&node), [92.0, 360.0, 228.0]);
+        assert!(!node.panels().is_empty() && !node.is_folded());
+    }
+
+    #[test]
+    fn a_stack_folds_according_to_what_holds_it() {
+        let stack = |panel, size| Child { node: Node::tabs(vec![panel]), size };
+        let mut row = Node::Split { axis: Axis::Horizontal, children: vec![stack(Panel::Wheel, 380.0), stack(Panel::Sliders, 380.0)] };
+        assert_eq!(row.toggle_fold(Panel::Wheel, [760.0, 360.0]), [-356.0, 0.0]);
+        assert_eq!(row.min_size(Axis::Horizontal), 24.0 + 240.0);
+        assert_eq!(row.min_size(Axis::Vertical), 170.0);
+
+        let mut alone = Node::tabs(vec![Panel::Wheel]);
+        assert_eq!(alone.toggle_fold(Panel::Wheel, [380.0, 360.0]), [0.0, -340.0]);
+        assert_eq!(alone.min_size(Axis::Vertical), 20.0);
+        assert_eq!(alone.min_size(Axis::Horizontal), 170.0);
+        assert_eq!(alone.max_length(Axis::Vertical), Some(20.0));
+        assert_eq!(alone.max_length(Axis::Horizontal), None);
+        assert_eq!(alone.toggle_fold(Panel::Wheel, [380.0, 20.0]), [0.0, 340.0]);
+        assert_eq!(alone.max_length(Axis::Vertical), None);
+    }
+
+    #[test]
+    fn folding_inside_a_nested_split_leaves_the_window_to_the_neighbours() {
+        let stack = |panel, size| Child { node: Node::tabs(vec![panel]), size };
+        let column = Node::Split { axis: Axis::Vertical, children: vec![stack(Panel::Slots, 100.0), stack(Panel::Sliders, 300.0)] };
+        let mut node = Node::Split {
+            axis: Axis::Horizontal,
+            children: vec![stack(Panel::Wheel, 300.0), Child { node: column, size: 300.0 }],
+        };
+        assert_eq!(node.toggle_fold(Panel::Slots, [600.0, 400.0]), [0.0, 0.0]);
+        let Node::Split { children, .. } = &node else { unreachable!() };
+        assert_eq!(heights(&children[1].node), [20.0, 380.0]);
+        assert_eq!(node.toggle_fold(Panel::Slots, [600.0, 400.0]), [0.0, 0.0]);
+        let Node::Split { children, .. } = &node else { unreachable!() };
+        assert_eq!(heights(&children[1].node), [100.0, 300.0]);
+    }
+
+    #[test]
+    fn a_folded_stack_keeps_out_of_a_dragged_line_and_comes_back_at_its_old_length() {
+        let mut node = Node::stack([92.0, 360.0, 228.0]);
+        node.toggle_fold(Panel::Sliders, [570.0, 680.0]);
+        let Node::Split { children, .. } = &mut node else { unreachable!() };
+        assert_eq!(drag_line(children, Axis::Vertical, 2, 50.0, SLIDERS, 680.0), 0.0);
+        assert_eq!(drag_line(children, Axis::Vertical, 0, -10.0, SLIDERS, 680.0), 0.0);
+        assert_eq!(heights(&node), [82.0, 370.0, 20.0]);
+        let (home, _) = node.hide(Panel::Sliders).unwrap();
+        assert_eq!(home.size, Some(228.0));
+    }
+
+    #[test]
+    fn a_fold_that_no_longer_fits_where_it_ended_up_is_undone() {
+        let mut node = Node::tabs(vec![Panel::Wheel]);
+        node.toggle_fold(Panel::Wheel, [380.0, 360.0]);
+        node.settle_folds(Axis::Vertical);
+        assert!(node.is_folded());
+        node.settle_folds(Axis::Horizontal);
+        assert!(!node.is_folded());
+    }
+
+    #[test]
+    fn a_layout_saved_before_folding_still_loads_and_an_open_stack_saves_the_same() {
+        let node: Node = serde_json::from_str(r#"{"Tabs":{"panels":["Slots"],"active":0}}"#).unwrap();
+        assert!(!node.is_folded());
+        assert_eq!(serde_json::to_string(&node).unwrap(), r#"{"Tabs":{"panels":["Slots"],"active":0}}"#);
+    }
+
+    #[test]
+    fn by_default_the_wheel_takes_what_the_window_gains_and_gives_it_back_first() {
+        let mut node = Node::stack([92.0, 360.0, 228.0]);
+        node.fit(570.0, 780.0, Flexible::Auto);
+        assert_eq!(heights(&node), [92.0, 460.0, 228.0]);
+        node.fit(570.0, 680.0, Flexible::Auto);
+        assert_eq!(heights(&node), [92.0, 360.0, 228.0]);
+        // Then the rest, from the last one.
+        node.fit(570.0, 500.0, Flexible::Auto);
+        assert_eq!(heights(&node), [92.0, 220.0, 188.0]);
+    }
+
+    #[test]
+    fn the_flexible_module_can_be_chosen_or_be_none_at_all() {
+        let mut node = Node::stack([92.0, 360.0, 228.0]);
+        node.fit(570.0, 780.0, Flexible::Panel(Panel::Slots));
+        assert_eq!(heights(&node), [192.0, 360.0, 228.0]);
+        let mut node = Node::stack([92.0, 360.0, 228.0]);
+        node.fit(570.0, 780.0, Flexible::Nothing);
+        assert_eq!(heights(&node), [92.0, 360.0, 228.0]);
+        // Empty room goes first when the window gets smaller again.
+        node.fit(570.0, 590.0, Flexible::Nothing);
+        assert_eq!(heights(&node), [92.0, 328.0, 170.0]);
+    }
+
+    #[test]
+    fn room_reaches_the_flexible_module_through_a_nested_split() {
+        let stack = |panel, size| Child { node: Node::tabs(vec![panel]), size };
+        let row = Node::Split { axis: Axis::Horizontal, children: vec![stack(Panel::Wheel, 300.0), stack(Panel::Sliders, 300.0)] };
+        let mut node = Node::Split { axis: Axis::Vertical, children: vec![Child { node: row, size: 300.0 }, stack(Panel::Slots, 100.0)] };
+        node.fit(800.0, 500.0, Flexible::Auto);
+        assert_eq!(heights(&node), [400.0, 100.0]);
+        let Node::Split { children, .. } = &node else { unreachable!() };
+        assert_eq!(heights(&children[0].node), [500.0, 300.0]);
+    }
+
+    #[test]
+    fn a_folded_flexible_module_leaves_the_room_to_the_others() {
+        let mut node = Node::stack([92.0, 360.0, 228.0]);
+        node.toggle_fold(Panel::Wheel, [570.0, 680.0]);
+        node.fit(570.0, 440.0, Flexible::Auto);
+        assert_eq!(heights(&node), [92.0, 20.0, 328.0]);
+    }
+
+    #[test]
+    fn a_shrunk_module_hands_its_room_to_the_flexible_one_or_if_it_is_that_to_the_last() {
+        let mut node = Node::stack([92.0, 360.0, 228.0]);
+        let Node::Split { children, .. } = &mut node else { unreachable!() };
+        assert_eq!(drag_line(children, Axis::Vertical, 0, -10.0, Flexible::Auto, 680.0), 0.0);
+        assert_eq!(drag_line(children, Axis::Vertical, 1, -20.0, Flexible::Auto, 680.0), 0.0);
+        assert_eq!(heights(&node), [82.0, 350.0, 248.0]);
+    }
+
+    #[test]
+    fn a_choice_follows_the_window_it_was_made_in() {
+        let mut node = Node::tabs(vec![Panel::Slots, Panel::Sliders]);
+        assert_eq!(Flexible::Auto.of(&node), Some(Panel::Sliders));
+        assert_eq!(Flexible::Panel(Panel::Wheel).settled(&node), Flexible::Auto);
+        assert_eq!(Flexible::Panel(Panel::Slots).settled(&node), Flexible::Panel(Panel::Slots));
+        assert_eq!(Flexible::Nothing.settled(&node), Flexible::Nothing);
+        node.dock(Panel::Slots, Drop::Tab(0), vec![Panel::Wheel]);
+        assert_eq!(Flexible::Auto.of(&node), Some(Panel::Wheel));
+    }
+
+    #[test]
     fn only_a_split_along_the_axis_decides_its_total() {
         let node = nested();
         assert_eq!(node.total(Axis::Horizontal), Some(600.0));
@@ -704,7 +1072,7 @@ mod tests {
     fn every_panel_must_appear_exactly_once_among_the_windows() {
         assert!(is_complete(&[&Node::default()], &[]));
         assert!(is_complete(&[&nested()], &[]));
-        let tabs = |panels: &[Panel]| Node::Tabs { panels: panels.to_vec(), active: 0 };
+        let tabs = |panels: &[Panel]| Node::Tabs { panels: panels.to_vec(), active: 0, fold: None };
         assert!(is_complete(&[&tabs(&PANELS)], &[]));
         assert!(!is_complete(&[&tabs(&[Panel::Wheel, Panel::Wheel, Panel::Slots])], &[]));
         assert!(!is_complete(&[&tabs(&[Panel::Wheel])], &[]));
@@ -764,7 +1132,7 @@ mod tests {
 
     #[test]
     fn a_hidden_tab_returns_to_its_place_and_the_last_panel_cannot_be_hidden() {
-        let start = Node::Tabs { panels: PANELS.to_vec(), active: 1 };
+        let start = Node::Tabs { panels: PANELS.to_vec(), active: 1, fold: None };
         let mut node = start.clone();
         let (home, freed) = node.hide(Panel::Wheel).unwrap();
         assert_eq!((home.size, freed), (None, [0.0, 0.0]));
@@ -782,7 +1150,7 @@ mod tests {
     #[test]
     fn rounding_reaches_nested_sizes() {
         let mut node = nested();
-        node.fit(800.4, 500.4);
+        node.fit(800.4, 500.4, SLIDERS);
         let Node::Split { children, .. } = node.rounded() else { unreachable!() };
         assert_eq!(children[1].size, 500.0);
         assert_eq!(heights(&children[1].node), [100.0, 400.0]);

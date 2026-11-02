@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::color::Model;
 use crate::csp::auth::Pairing;
 use crate::csp::{Rgb, Slot};
-use crate::layout::{Home, Node, Panel};
+use crate::layout::{Flexible, Home, Node, Panel};
 use crate::picker::SliderTab;
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -26,6 +26,8 @@ pub struct SavedLayout {
     /// How the panels are arranged, with sizes at 100% scale.
     #[serde(default)]
     pub dock: Option<Node>,
+    #[serde(default)]
+    pub flexible: Flexible,
     /// What 1.0.1 saved instead of `dock`: the heights of the colour slots, the wheel and the
     /// sliders, at 100% scale.
     #[serde(default, skip_serializing)]
@@ -54,6 +56,8 @@ fn always() -> bool {
 pub struct SavedWindow {
     pub id: u64,
     pub node: Node,
+    #[serde(default)]
+    pub flexible: Flexible,
     pub open: bool,
     pub position: Option<[i32; 2]>,
     pub size: Option<[i32; 2]>,
@@ -185,6 +189,7 @@ mod tests {
         layout.floating.push(SavedWindow {
             id: 4,
             node: Node::tabs(vec![Panel::Wheel]),
+            flexible: Flexible::Auto,
             open: true,
             position: Some([5, 6]),
             size: Some([7, 8]),

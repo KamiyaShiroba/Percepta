@@ -439,6 +439,13 @@ impl IconButton {
         response.clicked()
     }
 
+    /// With a hint for when the pen hovers over it.
+    pub fn show_hinted(&mut self, ui: &mut egui::Ui, area: Rect, id: egui::Id, hover_text: &str) -> bool {
+        let response = ui.interact(area, id, Sense::click());
+        self.paint(ui, &response, area.center(), false);
+        response.on_hover_text(hover_text).clicked()
+    }
+
     fn paint(&mut self, ui: &egui::Ui, response: &Response, center: Pos2, active: bool) {
         // Drawn smaller than the area that takes clicks, which stays easy to hit with a pen.
         let rect = Rect::from_center_size(center, Vec2::splat(ICON_BUTTON_SIZE * ICON_SCALE));

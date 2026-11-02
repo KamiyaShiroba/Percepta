@@ -16,7 +16,7 @@ use crate::csp::client::CspSlots;
 use crate::csp::worker::{Command, Event, Worker};
 use crate::csp::{Rgb, Slot};
 use crate::frame::{self, CORNER_RADIUS, DRAG_THRESHOLD, TITLE_BAR_HEIGHT, TITLE_BUTTON_WIDTH};
-use crate::layout::{self, Axis, Drop as DockDrop, Home, Node, Panel, DEFAULT_HEIGHTS, MODULE_TITLE_HEIGHT, PANELS};
+use crate::layout::{self, Axis, Drop as DockDrop, Flexible, Fold, Home, Node, Panel, DEFAULT_HEIGHTS, MODULE_TITLE_HEIGHT, PANELS};
 use crate::picker::{app_icon_pixels, switch, IconButton, Picker};
 use crate::platform::{self, click_csp_title_bar, pen_or_mouse_down, PaletteWindow};
 use crate::session::{HiddenPanel, SavedColors, SavedLayout, SavedSettings, SavedWindow};
@@ -99,6 +99,13 @@ const SAVE_DELAY: Duration = Duration::from_secs(1);
 const SETTINGS_ICON: &str = include_str!("../assets/settings.svg");
 const CLOSE_ICON: &str = include_str!("../assets/close.svg");
 const MENU_ICON: &str = include_str!("../assets/menu.svg");
+/// Which way a stack goes when pressed: up and down in a column, left and right in a row.
+const FOLD_ICONS: [&str; 4] = [
+    include_str!("../assets/chevron-up.svg"),
+    include_str!("../assets/chevron-down.svg"),
+    include_str!("../assets/chevron-left.svg"),
+    include_str!("../assets/chevron-right.svg"),
+];
 /// The window eframe opens, which is the one that always exists, closed or not.
 const MAIN_WINDOW: u64 = 0;
 /// How far a window that has no place of its own opens from the first one, in physical pixels.
@@ -232,6 +239,7 @@ struct PanelWindow {
     size: Option<[i32; 2]>,
     /// Its inside when it appears with no size on record.
     first_size: egui::Vec2,
+    flexible: Flexible,
     scale: f32,
     /// Its inside when it was last drawn.
     inner: egui::Vec2,
@@ -255,6 +263,7 @@ impl PanelWindow {
             position: None,
             size: None,
             first_size: egui::Vec2::ZERO,
+            flexible: Flexible::Auto,
             scale,
             inner: egui::Vec2::ZERO,
             min_size: egui::Vec2::ZERO,
@@ -280,6 +289,11 @@ impl PanelWindow {
         let current = if self.inner == egui::Vec2::ZERO { self.first_size } else { self.inner };
         let [width, height] = self.node.min_at([current.x, current.y - title]);
         egui::vec2(width, height + title)
+    }
+
+    fn max_inner(&self) -> egui::Vec2 {
+        let length = |axis| self.node.max_length(axis).unwrap_or(f32::INFINITY);
+        egui::vec2(length(Axis::Horizontal), length(Axis::Vertical) + Self::title_height(&self.node))
     }
 
     /// Makes the inside of a window bigger or smaller by this much.
@@ -312,7 +326,7 @@ impl PanelWindow {
     }
 
     fn to_saved(&self) -> SavedWindow {
-        SavedWindow { id: self.id, node: self.node.rounded(), open: self.open, position: self.position, size: self.size }
+        SavedWindow { id: self.id, node: self.node.rounded(), flexible: self.flexible, open: self.open, position: self.position, size: self.size }
     }
 }
 
@@ -408,6 +422,15 @@ pub struct App {
     /// Windows to close and panels to show or hide, once the frame has been drawn.
     closing: Vec<u64>,
     toggling: Vec<Panel>,
+    /// The stack the pen has just asked to fold or unfold, in the window being drawn.
+    folding: Option<Panel>,
+    fold_icons: [IconButton; 4],
+    /// A stack whose title strip has just been right-clicked in the window being drawn, with
+    /// the panel on top.
+    flexible_asked: Option<(Panel, Vec<Panel>)>,
+    /// What the open menu of a title strip is about: the window, the panel, and whether it is
+    /// the flexible one now.
+    flexible_menu: Option<(u64, Panel, bool)>,
     dock_targets: Vec<DockTarget>,
     drop_indicator: frame::DropIndicator,
 
@@ -448,6 +471,7 @@ impl App {
                 wheel,
                 slider,
                 dock: None,
+                flexible: Flexible::Auto,
                 panels: None,
                 main_open: true,
                 floating: Vec::new(),
@@ -468,12 +492,14 @@ impl App {
         let scale = cc.egui_ctx.pixels_per_point();
         let mut main = PanelWindow::new(MAIN_WINDOW, dock, scale);
         main.hwnd = window.as_ref().map(PaletteWindow::hwnd);
+        main.flexible = layout.flexible;
         main.position = layout.position;
         main.size = layout.size;
         main.open = layout.main_open;
         let mut windows = vec![main];
         windows.extend(floating.into_iter().map(|saved| {
             let mut window = PanelWindow::new(saved.id, saved.node, scale);
+            window.flexible = saved.flexible;
             window.open = saved.open;
             window.position = saved.position;
             window.size = saved.size;
@@ -528,6 +554,10 @@ impl App {
             ghost_until: None,
             closing: Vec::new(),
             toggling: Vec::new(),
+            folding: None,
+            fold_icons: FOLD_ICONS.map(IconButton::new),
+            flexible_asked: None,
+            flexible_menu: None,
             dock_targets: Vec::new(),
             drop_indicator: frame::DropIndicator::new(),
             blocked: false,
@@ -582,6 +612,7 @@ impl App {
             wheel,
             slider,
             dock: Some(main.node.rounded()),
+            flexible: main.flexible,
             panels: None,
             main_open: main.open,
             floating: self.windows[1..].iter().map(PanelWindow::to_saved).collect(),
@@ -891,6 +922,13 @@ impl App {
             Some(tray::Request::Settings) => self.settings_open = true,
             Some(tray::Request::Quit) => self.quit(ctx),
             Some(tray::Request::TogglePanel(panel)) => self.toggling.push(panel),
+            Some(tray::Request::ToggleFlexible) => {
+                if let Some((id, panel, checked)) = self.flexible_menu.take() {
+                    if let Some(window) = self.windows.iter_mut().find(|window| window.id == id) {
+                        window.flexible = if checked { Flexible::Nothing } else { Flexible::Panel(panel) };
+                    }
+                }
+            }
             None => {}
         }
     }
@@ -1029,6 +1067,8 @@ impl App {
         window.scale = ctx.pixels_per_point();
         window.inner = rect.size();
         self.dock_targets.retain(|target| target.window != window.id);
+        window.node.settle_folds(Axis::Vertical);
+        window.flexible = window.flexible.settled(&window.node);
         let min_size = window.min_inner();
         if min_size != window.min_size {
             window.min_size = min_size;
@@ -1040,6 +1080,13 @@ impl App {
         } else if (rect.width() + 0.5 < min_size.x || rect.height() + 0.5 < min_size.y) && !grown {
             // Windows only applies a minimum the next time the window is resized.
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(rect.size().max(min_size)));
+        } else if !grown {
+            // All folded, there is nothing to use more room. Windows has no such edge for us
+            // to leave alone, so a window pulled past this goes back.
+            let max = window.max_inner();
+            if rect.width() > max.x + 0.5 || rect.height() > max.y + 0.5 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(rect.size().min(max)));
+            }
         }
 
         let bar = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), TITLE_BAR_HEIGHT));
@@ -1055,10 +1102,26 @@ impl App {
             self.restore_at = None;
         }
         let mut caption_left = menu.right() - rect.left();
+        let mut caption_right = TITLE_BUTTON_WIDTH;
         let mut changed = false;
         match &mut window.node {
-            Node::Tabs { panels, active } => {
-                let strip = egui::Rect::from_min_max(egui::pos2(menu.right(), bar.top()), bar.max);
+            Node::Tabs { panels, active, fold } => {
+                let buttons = TITLE_BUTTON_WIDTH * 2.0;
+                if rect.width() >= TITLE_BUTTON_WIDTH * 3.0 {
+                    caption_right = buttons;
+                    let button = egui::Rect::from_min_size(
+                        egui::pos2(bar.right() - buttons, bar.top()),
+                        egui::vec2(TITLE_BUTTON_WIDTH, bar.height()),
+                    );
+                    if self.fold_button(ui, button, id.with("fold"), Axis::Vertical, fold.is_some()) {
+                        self.folding = panels.first().copied();
+                    }
+                }
+                // The name gives way to the fold button as well as the close button.
+                let strip = egui::Rect::from_min_max(
+                    egui::pos2(menu.right(), bar.top()),
+                    egui::pos2(bar.right() - TITLE_BUTTON_WIDTH, bar.bottom()),
+                );
                 let (tear, tab_edges) = tabs_ui(ui, panels, active, strip, id);
                 // A lone panel has nothing but its name there, which drags the window like the rest.
                 if panels.len() > 1 {
@@ -1068,7 +1131,7 @@ impl App {
                     self.start_panel_drag(ui, host, torn, rect);
                 }
                 self.dock_targets.push(DockTarget { window: window.id, panels: panels.to_vec(), rect, tab_edges });
-                if let Some(&panel) = panels.get(*active).or(panels.first()) {
+                if let Some(&panel) = panels.get(*active).or(panels.first()).filter(|_| fold.is_none()) {
                     changed = self.panel_ui(ui, panel, below);
                 }
             }
@@ -1081,13 +1144,15 @@ impl App {
                     TITLE_TEXT,
                 );
                 if !self.dragging_splitter && !grown {
-                    window.node.fit(below.width(), below.height());
+                    window.node.fit(below.width(), below.height(), window.flexible);
                 }
                 let mut grow = egui::Vec2::ZERO;
-                self.node_ui(ui, &mut window.node, below, id.with("dock"), &mut changed, &mut grow, host);
+                let flexible = window.flexible;
+                self.node_ui(ui, &mut window.node, flexible, Axis::Vertical, below, id.with("dock"), &mut changed, &mut grow, host);
                 if grow.x > 0.0 || grow.y > 0.0 {
-                    let width = window.node.total(Axis::Horizontal).unwrap_or(below.width() + grow.x);
-                    let height = window.node.total(Axis::Vertical).unwrap_or(below.height() + grow.y);
+                    // Where nothing takes the room, it may hold more than the modules.
+                    let width = window.node.total(Axis::Horizontal).unwrap_or(0.0).max(below.width() + grow.x);
+                    let height = window.node.total(Axis::Vertical).unwrap_or(0.0).max(below.height() + grow.y);
                     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, TITLE_BAR_HEIGHT + height)));
                 }
             }
@@ -1095,7 +1160,20 @@ impl App {
         if changed {
             self.color_edited();
         }
-        frame::set_caption_left(hwnd as _, caption_left);
+        if let Some(panel) = self.folding.take() {
+            let room = [window.inner.x, window.inner.y - PanelWindow::title_height(&window.node)];
+            let [width, height] = window.node.toggle_fold(panel, room);
+            window.resize(egui::vec2(width, height));
+            ctx.request_repaint();
+        }
+        if let Some((panel, panels)) = self.flexible_asked.take() {
+            let checked = window.flexible.of(&window.node).is_some_and(|flexible| panels.contains(&flexible));
+            tray::open_flexible_menu(platform::cursor_position(), checked);
+            self.flexible_menu = Some((window.id, panel, checked));
+            // Not until the menu has closed: a click on CSP would close it.
+            self.restore_at = None;
+        }
+        frame::set_caption(hwnd as _, caption_left, caption_right);
         let close = egui::Rect::from_min_max(egui::pos2(bar.right() - TITLE_BUTTON_WIDTH, bar.top()), bar.max);
         if window.close_icon.show_in(ui, close, id.with("close")) {
             self.closing.push(window.id);
@@ -1103,10 +1181,13 @@ impl App {
         window_edge(ui);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn node_ui(
         &mut self,
         ui: &mut egui::Ui,
         node: &mut Node,
+        flexible: Flexible,
+        along_axis: Axis,
         rect: egui::Rect,
         id: egui::Id,
         changed: &mut bool,
@@ -1115,8 +1196,8 @@ impl App {
     ) {
         let (axis, children) = match node {
             Node::Split { axis, children } => (*axis, children),
-            Node::Tabs { panels, active } => {
-                self.stack_ui(ui, panels, active, rect, id, changed, host);
+            Node::Tabs { panels, active, fold } => {
+                self.stack_ui(ui, panels, active, *fold, along_axis, rect, id, changed, host);
                 return;
             }
         };
@@ -1125,13 +1206,15 @@ impl App {
             let before: f32 = children[..index].iter().map(|child| child.size).sum();
             let child_rect = span(rect, axis, start + before, start + before + children[index].size);
             let grown_before = *grow;
-            self.node_ui(ui, &mut children[index].node, child_rect, id.with(index), changed, grow, host);
+            self.node_ui(ui, &mut children[index].node, flexible, axis, child_rect, id.with(index), changed, grow, host);
             // A nested split that had the window grow has made this child bigger too.
             children[index].size += along((*grow - grown_before).to_pos2(), axis);
             if index + 1 < children.len() {
                 let line = start + before + children[index].size;
-                let delta = self.splitter_ui(ui, rect, axis, line, id.with(("splitter", index)));
-                let grown = layout::drag_line(children, axis, index, delta);
+                let folded = children[index].node.is_folded();
+                let delta = if folded { 0.0 } else { self.splitter_ui(ui, rect, axis, line, id.with(("splitter", index))) };
+                let total = along(rect.max, axis) - start;
+                let grown = layout::drag_line(children, axis, index, delta, flexible, total);
                 match axis {
                     Axis::Horizontal => grow.x += grown,
                     Axis::Vertical => grow.y += grown,
@@ -1146,23 +1229,124 @@ impl App {
         ui: &mut egui::Ui,
         panels: &[Panel],
         active: &mut usize,
+        fold: Option<Fold>,
+        along_axis: Axis,
         rect: egui::Rect,
         id: egui::Id,
         changed: &mut bool,
         host: Host,
     ) {
+        if fold.is_some_and(|fold| fold.axis == Axis::Horizontal) {
+            self.side_strip_ui(ui, panels, active, fold, rect, id, host);
+            return;
+        }
         let strip = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), MODULE_TITLE_HEIGHT));
+        self.ask_about_flexible(ui, strip, panels, *active);
         let content = egui::Rect::from_min_max(egui::pos2(rect.left(), strip.bottom()), rect.max);
         let background = ui.interact(strip, id.with("strip"), egui::Sense::drag());
         ui.painter().rect_filled(strip, 0.0, MODULE_TITLE_FILL);
         let (tear, tab_edges) = tabs_ui(ui, panels, active, strip, id);
+        let button = egui::Rect::from_min_max(egui::pos2(strip.right() - TITLE_BUTTON_WIDTH, strip.top()), strip.max);
+        if self.fold_button(ui, button, id.with("fold"), along_axis, fold.is_some()) {
+            self.folding = panels.first().copied();
+        }
         let tear = tear.or_else(|| dragged_far_enough(ui, &background).then(|| panels.to_vec()));
         if let Some(panels) = tear {
             self.start_panel_drag(ui, host, panels, rect);
+            self.open_size_of_drag(fold);
         }
         self.dock_targets.push(DockTarget { window: host.id, panels: panels.to_vec(), rect, tab_edges });
-        if let Some(&panel) = panels.get(*active).or(panels.first()) {
+        if let Some(&panel) = panels.get(*active).or(panels.first()).filter(|_| fold.is_none()) {
             *changed |= self.panel_ui(ui, panel, content);
+        }
+    }
+
+    /// A stack folded sideways: a narrow strip with the button on top and the names written
+    /// downwards. Pressing a name unfolds it on that tab.
+    #[allow(clippy::too_many_arguments)]
+    fn side_strip_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        panels: &[Panel],
+        active: &mut usize,
+        fold: Option<Fold>,
+        rect: egui::Rect,
+        id: egui::Id,
+        host: Host,
+    ) {
+        self.ask_about_flexible(ui, rect, panels, *active);
+        let background = ui.interact(rect, id.with("strip"), egui::Sense::drag());
+        ui.painter().rect_filled(rect, 0.0, MODULE_TITLE_FILL);
+        let button = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), MODULE_TITLE_HEIGHT));
+        if self.fold_button(ui, button, id.with("fold"), Axis::Horizontal, true) {
+            self.folding = panels.first().copied();
+        }
+        let font = egui::FontId::proportional(TITLE_FONT_SIZE);
+        let mut top = button.bottom();
+        let mut torn = None;
+        for (index, &panel) in panels.iter().enumerate() {
+            let name = panel_name(panel);
+            let line = ui.fonts_mut(|fonts| fonts.row_height(&font));
+            let height = line * name.chars().count() as f32 + MODULE_TITLE_PADDING;
+            let tab = egui::Rect::from_min_size(egui::pos2(rect.left(), top), egui::vec2(rect.width(), height));
+            let response = ui.interact(tab, id.with(("tab", index)), egui::Sense::click_and_drag());
+            if panels.len() > 1 && index == *active {
+                ui.painter().rect_filled(tab, 0.0, ACTIVE_TAB_FILL);
+            }
+            for (row, letter) in name.chars().enumerate() {
+                let center = egui::pos2(tab.center().x, tab.top() + line * (row as f32 + 0.5));
+                ui.painter().text(center, egui::Align2::CENTER_CENTER, letter, font.clone(), TITLE_TEXT);
+            }
+            if response.clicked() {
+                *active = index;
+                self.folding = Some(panel);
+            }
+            if panels.len() > 1 && dragged_far_enough(ui, &response) {
+                torn = Some(vec![panel]);
+            }
+            if panels.len() == 1 && dragged_far_enough(ui, &response) {
+                torn = Some(panels.to_vec());
+            }
+            top = tab.bottom();
+        }
+        let tear = torn.or_else(|| dragged_far_enough(ui, &background).then(|| panels.to_vec()));
+        if let Some(panels) = tear {
+            self.start_panel_drag(ui, host, panels, rect);
+            self.open_size_of_drag(fold);
+        }
+        let tab_edges = vec![rect.left(), rect.right()];
+        self.dock_targets.push(DockTarget { window: host.id, panels: panels.to_vec(), rect, tab_edges });
+    }
+
+    /// Notes a right click on a title strip. Only stacks among others have one to ask about:
+    /// a window with nothing else in it has nothing to share its room with.
+    fn ask_about_flexible(&mut self, ui: &egui::Ui, strip: egui::Rect, panels: &[Panel], active: usize) {
+        let clicked = ui.input(|input| {
+            input.pointer.secondary_clicked() && input.pointer.interact_pos().is_some_and(|pos| strip.contains(pos))
+        });
+        if let (true, Some(&panel)) = (clicked, panels.get(active).or(panels.first())) {
+            self.flexible_asked = Some((panel, panels.to_vec()));
+        }
+    }
+
+    /// The chevron that folds a stack along `axis` or unfolds it, pointing the way it will go.
+    /// Returns whether it was clicked.
+    fn fold_button(&mut self, ui: &mut egui::Ui, area: egui::Rect, id: egui::Id, axis: Axis, folded: bool) -> bool {
+        let icon = match (axis, folded) {
+            (Axis::Vertical, false) => 0,
+            (Axis::Vertical, true) => 1,
+            (Axis::Horizontal, false) => 2,
+            (Axis::Horizontal, true) => 3,
+        };
+        self.fold_icons[icon].show_hinted(ui, area, id, if folded { "展开" } else { "折叠" })
+    }
+
+    /// A folded stack that has been dragged away arrives unfolded, at its old size.
+    fn open_size_of_drag(&mut self, fold: Option<Fold>) {
+        let (Some(drag), Some(fold)) = (&mut self.dragging, fold) else { return };
+        match fold.axis {
+            Axis::Horizontal => drag.size.x = fold.length,
+            Axis::Vertical => drag.size.y = fold.length,
         }
     }
 
@@ -2156,6 +2340,7 @@ mod tests {
             wheel,
             slider,
             dock: None,
+            flexible: Flexible::Auto,
             panels: Some([80, 300, 170]),
             main_open: true,
             floating: Vec::new(),
@@ -2175,6 +2360,7 @@ mod tests {
         layout.floating.push(SavedWindow {
             id: 1,
             node: Node::tabs(vec![Panel::Sliders]),
+            flexible: Flexible::Auto,
             open: false,
             position: None,
             size: None,

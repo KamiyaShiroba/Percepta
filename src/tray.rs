@@ -28,6 +28,8 @@ const QUIT_MESSAGE: u32 = WM_APP + 2;
 const SHOW_MESSAGE: u32 = WM_APP + 3;
 /// A window's own menu button, with where to open in `wparam` and `lparam`.
 const WINDOW_MENU_MESSAGE: u32 = WM_APP + 4;
+/// A module's title strip, likewise.
+const FLEXIBLE_MENU_MESSAGE: u32 = WM_APP + 5;
 const ICON_ID: u32 = 1;
 const ICON_SIZE: i32 = 32;
 const MENU_SHOW: usize = 1;
@@ -35,6 +37,7 @@ const MENU_SETTINGS: usize = 2;
 const MENU_QUIT: usize = 3;
 /// Followed by the other panels, in the order of `PANELS`.
 const MENU_FIRST_PANEL: usize = 4;
+const MENU_FLEXIBLE: usize = 1;
 
 const REQUEST_NONE: u8 = 0;
 const REQUEST_SHOW: u8 = 1;
@@ -42,6 +45,7 @@ const REQUEST_SETTINGS: u8 = 2;
 const REQUEST_QUIT: u8 = 3;
 /// Followed by the other panels, in the order of `PANELS`.
 const REQUEST_FIRST_PANEL: u8 = 4;
+const REQUEST_FLEXIBLE: u8 = 100;
 
 /// The last thing asked for through the tray, until the UI picks it up.
 static REQUEST: AtomicU8 = AtomicU8::new(REQUEST_NONE);
@@ -51,6 +55,8 @@ static TRAY_WINDOW: AtomicIsize = AtomicIsize::new(0);
 static SHOWN_PANELS: AtomicU8 = AtomicU8::new(0);
 /// Set when a menu opened from a window has closed, until the UI has taken note.
 static WINDOW_MENU_ENDED: AtomicBool = AtomicBool::new(false);
+/// Whether the module that the next flexible menu is for is the flexible one.
+static FLEXIBLE_CHECKED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
@@ -58,6 +64,7 @@ pub enum Request {
     Settings,
     Quit,
     TogglePanel(Panel),
+    ToggleFlexible,
 }
 
 /// Returns what the user asked for since the last call.
@@ -66,6 +73,7 @@ pub fn take_request() -> Option<Request> {
         REQUEST_SHOW => Some(Request::Show),
         REQUEST_SETTINGS => Some(Request::Settings),
         REQUEST_QUIT => Some(Request::Quit),
+        REQUEST_FLEXIBLE => Some(Request::ToggleFlexible),
         value => PANELS.get((value as usize).wrapping_sub(REQUEST_FIRST_PANEL as usize)).copied().map(Request::TogglePanel),
     }
 }
@@ -90,6 +98,14 @@ pub fn open_menu([x, y]: [i32; 2]) {
     let hwnd = TRAY_WINDOW.load(Ordering::Relaxed) as HWND;
     // SAFETY: takes no pointers, and a missing window only makes it fail.
     unsafe { PostMessageW(hwnd, WINDOW_MENU_MESSAGE, x as isize as WPARAM, y as LPARAM) };
+}
+
+/// Opens the menu of a module's title strip at this point, in the same way as `open_menu`.
+pub fn open_flexible_menu([x, y]: [i32; 2], checked: bool) {
+    FLEXIBLE_CHECKED.store(checked, Ordering::Relaxed);
+    let hwnd = TRAY_WINDOW.load(Ordering::Relaxed) as HWND;
+    // SAFETY: takes no pointers, and a missing window only makes it fail.
+    unsafe { PostMessageW(hwnd, FLEXIBLE_MENU_MESSAGE, x as isize as WPARAM, y as LPARAM) };
 }
 
 /// Whether a menu opened from a window has closed since the last call.
@@ -240,6 +256,27 @@ fn show_menu(hwnd: HWND, at: Option<POINT>) {
     }
 }
 
+fn show_flexible_menu(hwnd: HWND, point: POINT) {
+    // SAFETY: as in `show_menu`.
+    unsafe {
+        let previous = GetForegroundWindow();
+        let menu = CreatePopupMenu();
+        let check = if FLEXIBLE_CHECKED.load(Ordering::Relaxed) { MF_CHECKED } else { 0 };
+        AppendMenuW(menu, MF_STRING | check, MENU_FLEXIBLE, w!("随窗口伸缩"));
+        SetForegroundWindow(hwnd);
+        let chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, ptr::null()) as usize;
+        PostMessageW(hwnd, WM_NULL, 0, 0);
+        DestroyMenu(menu);
+        if !previous.is_null() {
+            SetForegroundWindow(previous);
+        }
+        WINDOW_MENU_ENDED.store(true, Ordering::Relaxed);
+        if chosen == MENU_FLEXIBLE {
+            request(REQUEST_FLEXIBLE);
+        }
+    }
+}
+
 unsafe extern "system" fn tray_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
     // SAFETY: the name is a static string.
@@ -253,6 +290,7 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, message: u32, wparam: WPARAM, lp
         QUIT_MESSAGE => request(REQUEST_QUIT),
         SHOW_MESSAGE => request(REQUEST_SHOW),
         WINDOW_MENU_MESSAGE => show_menu(hwnd, Some(POINT { x: wparam as i32, y: lparam as i32 })),
+        FLEXIBLE_MENU_MESSAGE => show_flexible_menu(hwnd, POINT { x: wparam as i32, y: lparam as i32 }),
         _ if message == taskbar_created => add_icon(hwnd, ICON.load(Ordering::Relaxed) as HICON),
         _ => {}
     }
