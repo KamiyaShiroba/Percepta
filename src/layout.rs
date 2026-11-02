@@ -5,9 +5,15 @@
 use serde::{Deserialize, Serialize};
 
 /// All of these are at 100% scale.
-const MIN_PANEL_WIDTH: f32 = 240.0;
+///
+/// The colour slots, the wheel and the sliders, as the order that `Node::stack` puts them in.
+pub const MIN_WIDTHS: [f32; 3] = [120.0, 170.0, 240.0];
 /// The strip above a panel or a stack of tabs, with its name, that it is dragged by.
 pub const MODULE_TITLE_HEIGHT: f32 = 20.0;
+/// The colour slots stay a row below this height.
+pub const SLOTS_SQUARE_MIN_HEIGHT: f32 = 200.0;
+/// When they are alone in a window, and from `SLOTS_SQUARE_MIN_HEIGHT` on.
+pub const SLOTS_NARROWEST: f32 = 50.0;
 /// The colour slots, the wheel and the sliders, as the order that `Node::stack` puts them in.
 /// All with their title strips.
 pub const MIN_HEIGHTS: [f32; 3] = [80.0, 220.0, 170.0];
@@ -25,7 +31,9 @@ pub const PANELS: [Panel; 3] = [Panel::Slots, Panel::Wheel, Panel::Sliders];
 impl Panel {
     fn min_size(self, axis: Axis) -> f32 {
         match (axis, self) {
-            (Axis::Horizontal, _) => MIN_PANEL_WIDTH,
+            (Axis::Horizontal, Panel::Slots) => MIN_WIDTHS[0],
+            (Axis::Horizontal, Panel::Wheel) => MIN_WIDTHS[1],
+            (Axis::Horizontal, Panel::Sliders) => MIN_WIDTHS[2],
             (Axis::Vertical, Panel::Slots) => MIN_HEIGHTS[0],
             (Axis::Vertical, Panel::Wheel) => MIN_HEIGHTS[1],
             (Axis::Vertical, Panel::Sliders) => MIN_HEIGHTS[2],
@@ -316,6 +324,20 @@ impl Node {
             Node::Tabs { panels, .. } => panels.contains(&panel).then_some(self),
             Node::Split { children, .. } => children.iter_mut().find_map(|child| child.node.stack_mut(panel)),
         }
+    }
+
+    /// The minimum width and height of a window holding only this, as it is now. The colour
+    /// slots can be low or narrow but not both, so each stops the window where the other has
+    /// not made room yet. The window never changes size by itself on the way.
+    pub fn min_at(&self, [width, height]: [f32; 2]) -> [f32; 2] {
+        let [min_width, min_height] = [self.min_size(Axis::Horizontal), self.min_size(Axis::Vertical)];
+        if !matches!(self, Node::Tabs { panels, .. } if panels[..] == [Panel::Slots]) {
+            return [min_width, min_height];
+        }
+        [
+            if height >= SLOTS_SQUARE_MIN_HEIGHT { SLOTS_NARROWEST } else { min_width },
+            if width < min_width { SLOTS_SQUARE_MIN_HEIGHT } else { min_height },
+        ]
     }
 
     pub fn min_size(&self, axis: Axis) -> f32 {
@@ -651,13 +673,24 @@ mod tests {
     #[test]
     fn a_nested_split_fits_itself_and_counts_towards_its_parents_minimums() {
         let mut node = nested();
-        assert_eq!(node.min_size(Axis::Horizontal), 480.0);
+        assert_eq!(node.min_size(Axis::Horizontal), 410.0);
         // The taller of the wheel, and the slots and sliders together.
         assert_eq!(node.min_size(Axis::Vertical), 250.0);
         node.fit(800.0, 500.0);
         assert_eq!(heights(&node), [300.0, 500.0]);
         let Node::Split { children, .. } = &node else { unreachable!() };
         assert_eq!(heights(&children[1].node), [100.0, 400.0]);
+    }
+
+    #[test]
+    fn the_slots_alone_go_narrow_only_while_tall_and_low_only_while_wide() {
+        let slots = Node::tabs(vec![Panel::Slots]);
+        assert_eq!(slots.min_at([300.0, 100.0]), [120.0, 80.0]);
+        assert_eq!(slots.min_at([120.0, 100.0]), [120.0, 80.0]);
+        assert_eq!(slots.min_at([300.0, 200.0]), [50.0, 80.0]);
+        assert_eq!(slots.min_at([119.0, 300.0]), [50.0, 200.0]);
+        let others = Node::tabs(vec![Panel::Slots, Panel::Wheel]);
+        assert_eq!(others.min_at([300.0, 300.0]), [170.0, 220.0]);
     }
 
     #[test]

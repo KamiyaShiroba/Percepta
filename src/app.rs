@@ -22,7 +22,7 @@ use crate::platform::{self, click_csp_title_bar, pen_or_mouse_down, PaletteWindo
 use crate::session::{HiddenPanel, SavedColors, SavedLayout, SavedSettings, SavedWindow};
 use crate::tray::{self, Tray};
 use crate::update::{self, Updater};
-use crate::{qr, session};
+use crate::{qr, session, slot_layout};
 
 /// A read-back matching a colour sent this recently is our own echo, not an edit
 /// made in CSP, so it must not make the sliders jump back.
@@ -42,17 +42,9 @@ const RESTORE_POLL: Duration = Duration::from_millis(30);
 const WARNING: Color32 = Color32::from_rgb(220, 160, 60);
 /// After choosing a slot here, CSP's report may lag; do not let it undo the choice.
 const SLOT_HOLD: Duration = Duration::from_millis(300);
-/// Relative widths of the foreground, background and transparent slots.
-const SLOT_WIDTHS: [f32; 3] = [5.0, 2.0, 2.0];
-const MIN_SLOT_CHIP_HEIGHT: f32 = 18.0;
-/// Below the colour slots, the row with the HEX field.
-const HEX_ROW_ROOM: f32 = 25.0;
-const SLOT_CHIP_GAP: f32 = 6.0;
 /// The active slot's outline sits around the colour, with this much room for it.
 const SLOT_OUTLINE_ROOM: f32 = 3.0;
 const SLOT_CORNER: f32 = 5.0;
-const HEX_WIDTH: f32 = 76.0;
-const STATUS_DOT_SIZE: f32 = 9.0;
 const CONNECTED: Color32 = Color32::from_rgb(70, 180, 100);
 const WAITING: Color32 = Color32::from_rgb(205, 180, 40);
 const DISCONNECTED: Color32 = Color32::from_gray(150);
@@ -283,8 +275,11 @@ impl PanelWindow {
     }
 
     fn min_inner(&self) -> egui::Vec2 {
-        let height = Self::title_height(&self.node) + self.node.min_size(Axis::Vertical);
-        egui::vec2(self.node.min_size(Axis::Horizontal), height)
+        let title = Self::title_height(&self.node);
+        // Until it has been drawn, it only has the size it is going to get.
+        let current = if self.inner == egui::Vec2::ZERO { self.first_size } else { self.inner };
+        let [width, height] = self.node.min_at([current.x, current.y - title]);
+        egui::vec2(width, height + title)
     }
 
     /// Makes the inside of a window bigger or smaller by this much.
@@ -1050,8 +1045,10 @@ impl App {
         let bar = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), TITLE_BAR_HEIGHT));
         let below = egui::Rect::from_min_max(egui::pos2(rect.left(), bar.bottom()), rect.max);
         ui.painter().rect_filled(bar, 0.0, TITLE_BAR_FILL);
-        let menu = egui::Rect::from_min_size(bar.min, egui::vec2(TITLE_BUTTON_WIDTH, bar.height()));
-        if window.menu_icon.show_in(ui, menu, id.with("menu")) {
+        // Too narrow for it, the bar is better left to drag the window by. The tray has the same menu.
+        let menu_width = if rect.width() < TITLE_BUTTON_WIDTH * 3.0 { 0.0 } else { TITLE_BUTTON_WIDTH };
+        let menu = egui::Rect::from_min_size(bar.min, egui::vec2(menu_width, bar.height()));
+        if menu_width > 0.0 && window.menu_icon.show_in(ui, menu, id.with("menu")) {
             let [x, y] = frame::window_origin(hwnd as _);
             tray::open_menu([x + (menu.left() * window.scale) as i32, y + (menu.bottom() * window.scale) as i32]);
             // Not until the menu has closed: a click on CSP would close it.
@@ -1623,50 +1620,57 @@ impl App {
         if !self.keyboards.values().any(|keyboard| keyboard.typing) {
             self.hex = to_hex(rgb);
         }
+        let parts = slot_layout::arrange(ui.max_rect());
+        // Where they overlap, the active one is on top.
+        let (back, front) = if self.slots.active == Slot::Sub {
+            ((Slot::Main, parts.main, "前景色"), (Slot::Sub, parts.sub, "背景色"))
+        } else {
+            ((Slot::Sub, parts.sub, "背景色"), (Slot::Main, parts.main, "前景色"))
+        };
         let mut chosen = None;
-        let chip_height = (ui.available_height() - HEX_ROW_ROOM).max(MIN_SLOT_CHIP_HEIGHT);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = SLOT_CHIP_GAP;
-            let unit = (ui.available_width() - SLOT_CHIP_GAP * 2.0) / SLOT_WIDTHS.iter().sum::<f32>();
-            let slots = [(Slot::Main, "前景色"), (Slot::Sub, "背景色"), (Slot::Transparent, "透明色")];
-            for ((slot, name), width) in slots.into_iter().zip(SLOT_WIDTHS) {
-                let size = egui::vec2(unit * width, chip_height);
-                if slot_chip(ui, size, self.slots.color(slot), self.slots.active == slot, name) {
-                    chosen = Some(slot);
-                }
+        for (slot, rect, name) in [back, front, (Slot::Transparent, parts.transparent, "透明色")] {
+            if slot_chip(ui, rect, self.slots.color(slot), self.slots.active == slot, name) {
+                chosen = Some(slot);
             }
-        });
+        }
         if let Some(slot) = chosen {
             self.choose_slot(slot);
         }
-        ui.horizontal(|ui| {
-            ui.label("HEX");
-            let edit = ui.add(egui::TextEdit::singleline(&mut self.hex).desired_width(HEX_WIDTH));
-            if edit.changed() {
+
+        if let Some(rect) = parts.hex_label {
+            ui.put(rect, egui::Label::new("HEX").extend());
+        }
+        if let Some(rect) = parts.hex {
+            let field = egui::TextEdit::singleline(&mut self.hex).id_salt("hex").desired_width(rect.width());
+            if ui.put(rect, field).changed() {
                 if let Some(rgb) = from_hex(&self.hex) {
                     self.color.set_rgb8(rgb);
                     self.color_edited();
                 }
             }
-            let (text, color) = self.status();
-            let (dot, _) = ui.allocate_exact_size(egui::Vec2::splat(STATUS_DOT_SIZE), egui::Sense::hover());
-            ui.painter().circle_filled(dot.center(), STATUS_DOT_SIZE / 2.0, color);
-            ui.label(RichText::new(text).color(color));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let update_waiting = matches!(self.updater.state, update::State::Available(_));
-                let hover_text = if update_waiting { "设置（有新版本）" } else { "设置" };
-                if self.settings_icon.show(ui, self.settings_open, hover_text) {
-                    if self.settings_open {
-                        self.close_settings();
-                    } else {
-                        self.settings_open = true;
-                    }
-                }
-                if update_waiting {
-                    ui.painter().circle_filled(ui.min_rect().right_top(), UPDATE_DOT_RADIUS, CONNECTED);
-                }
-            });
-        });
+        }
+
+        let (text, color) = self.status();
+        ui.painter().circle_filled(parts.dot, slot_layout::DOT_SIZE / 2.0, color);
+        let dot = egui::Rect::from_center_size(parts.dot, egui::Vec2::splat(slot_layout::DOT_SIZE));
+        ui.interact(dot, ui.scope_id().with("status"), egui::Sense::hover()).on_hover_text(text);
+        if let Some(rect) = parts.status {
+            ui.put(rect, egui::Label::new(RichText::new(text).color(color)).extend());
+        }
+
+        let update_waiting = matches!(self.updater.state, update::State::Available(_));
+        let hover_text = if update_waiting { "设置（有新版本）" } else { "设置" };
+        let mut button = ui.new_child(egui::UiBuilder::new().max_rect(parts.settings));
+        if self.settings_icon.show(&mut button, self.settings_open, hover_text) {
+            if self.settings_open {
+                self.close_settings();
+            } else {
+                self.settings_open = true;
+            }
+        }
+        if update_waiting {
+            ui.painter().circle_filled(parts.settings.right_top(), UPDATE_DOT_RADIUS, CONNECTED);
+        }
     }
 
     /// Every text is the same length, so that the line never shifts.
@@ -1979,8 +1983,11 @@ fn tabs_ui(
                 ui.painter().rect_filled(tab, 0.0, ACTIVE_TAB_FILL);
             }
         }
-        let text = egui::pos2(tab.left() + MODULE_TITLE_PADDING, tab.center().y - galley.size().y / 2.0);
-        ui.painter().galley(text, galley, TITLE_TEXT);
+        // A lone name gives way to the close button, on a window too narrow for both.
+        if panels.len() > 1 || tab.right() <= strip.right() - TITLE_BUTTON_WIDTH {
+            let text = egui::pos2(tab.left() + MODULE_TITLE_PADDING, tab.center().y - galley.size().y / 2.0);
+            ui.painter().galley(text, galley, TITLE_TEXT);
+        }
         left += width;
         edges.push(left);
     }
@@ -2047,10 +2054,12 @@ fn span(rect: egui::Rect, axis: Axis, start: f32, end: f32) -> egui::Rect {
 
 /// A colour slot's button: its colour, or a checkerboard for transparent, outlined in
 /// the accent colour while active. Returns whether it was clicked.
-fn slot_chip(ui: &mut egui::Ui, size: egui::Vec2, rgb: Option<Rgb>, active: bool, name: &str) -> bool {
-    let (outer, response) = ui.allocate_exact_size(size, egui::Sense::click());
+fn slot_chip(ui: &mut egui::Ui, outer: egui::Rect, rgb: Option<Rgb>, active: bool, name: &str) -> bool {
+    let response = ui.interact(outer, ui.scope_id().with(name), egui::Sense::click());
     let rect = outer.shrink(SLOT_OUTLINE_ROOM);
     let painter = ui.painter_at(outer);
+    // Sets it apart from a slot it overlaps.
+    painter.rect_filled(outer, SLOT_CORNER + SLOT_OUTLINE_ROOM, ui.visuals().panel_fill);
     match rgb {
         Some([r, g, b]) => {
             painter.rect_filled(rect, SLOT_CORNER, Color32::from_rgb(r, g, b));

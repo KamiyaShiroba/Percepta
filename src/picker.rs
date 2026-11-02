@@ -74,6 +74,8 @@ const TAB_PADDING: f32 = 3.0;
 const TAB_BOTTOM_GAP: f32 = 3.0;
 /// Below this the switch and the values beside it only fit with a shorter label.
 const FULL_LIMIT_LABEL_WIDTH: f32 = 295.0;
+/// Below this they do not fit on one line even so, and the switch goes on a line of its own.
+const ONE_LINE_READOUT_WIDTH: f32 = 224.0;
 const BADGE_SIZE: f32 = 14.0;
 const BADGE_CORNER: f32 = 3.0;
 const BADGE_FILL: Color32 = Color32::from_gray(50);
@@ -544,12 +546,16 @@ impl Picker {
             }
         });
         ui.add_space(TAB_BOTTOM_GAP);
-        let size = ui.available_width().min(ui.available_height() - READOUT_ROOM).max(MIN_WHEEL_SIZE);
+        let oklch = self.wheel_model == Model::Oklch;
+        let switch_line = oklch && ui.available_width() < ONE_LINE_READOUT_WIDTH;
+        let readout_room = if switch_line { READOUT_ROOM * 2.0 } else { READOUT_ROOM };
+        let size = ui.available_width().min(ui.available_height() - readout_room).max(MIN_WHEEL_SIZE);
         let mut changed = ui.vertical_centered(|ui| self.wheel(ui, color, size)).inner;
+        if switch_line {
+            changed |= limit_switch(ui, color, "限制在 sRGB 内");
+        }
         ui.horizontal(|ui| {
-            // Either panel in OKLCH can run into the limit, and this is the one place
-            // with room for the switch whichever tab the sliders are on.
-            if self.wheel_model == Model::Oklch || self.slider_tab == SliderTab::Color(Model::Oklch) {
+            if oklch && !switch_line {
                 let roomy = ui.available_width() >= FULL_LIMIT_LABEL_WIDTH;
                 changed |= limit_switch(ui, color, if roomy { "限制在 sRGB 内" } else { "sRGB" });
             }
@@ -586,7 +592,9 @@ impl Picker {
 
     fn model_sliders(&mut self, ui: &mut egui::Ui, color: &mut ColorState, model: Model) -> bool {
         let channels = channels(model);
-        let gap = slider_gap(channels.len());
+        // The limit's switch takes a row of its own.
+        let has_switch = model == Model::Oklch;
+        let gap = slider_gap(channels.len() + usize::from(has_switch));
         let mut changed = false;
         for (index, channel) in channels.iter().enumerate() {
             if index > 0 {
@@ -609,6 +617,12 @@ impl Picker {
             }
             color.set(model, updated);
             changed = true;
+        }
+        if has_switch {
+            ui.add_space(gap);
+            let line = vec2(ui.available_width(), SLIDER_HEIGHT);
+            let layout = egui::Layout::left_to_right(egui::Align::Center);
+            changed |= ui.allocate_ui_with_layout(line, layout, |ui| limit_switch(ui, color, "限制在 sRGB 内")).inner;
         }
         changed
     }
