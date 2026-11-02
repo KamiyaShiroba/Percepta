@@ -22,7 +22,7 @@ use crate::platform::{self, click_csp_title_bar, pen_or_mouse_down, PaletteWindo
 use crate::session::{HiddenPanel, SavedColors, SavedLayout, SavedSettings, SavedWindow};
 use crate::tray::{self, Tray};
 use crate::update::{self, Updater};
-use crate::{qr, session, slot_layout};
+use crate::{daemon, qr, session, slot_layout};
 
 /// A read-back matching a colour sent this recently is our own echo, not an edit
 /// made in CSP, so it must not make the sliders jump back.
@@ -431,6 +431,8 @@ pub struct App {
     /// What the open menu of a title strip is about: the window, the panel, and whether it is
     /// the flexible one now.
     flexible_menu: Option<(u64, Panel, bool)>,
+    /// The daemon has seen CSP minimized, and the windows are out of sight until it comes back.
+    csp_minimized: bool,
     dock_targets: Vec<DockTarget>,
     drop_indicator: frame::DropIndicator,
 
@@ -558,6 +560,7 @@ impl App {
             fold_icons: FOLD_ICONS.map(IconButton::new),
             flexible_asked: None,
             flexible_menu: None,
+            csp_minimized: false,
             dock_targets: Vec::new(),
             drop_indicator: frame::DropIndicator::new(),
             blocked: false,
@@ -573,6 +576,11 @@ impl App {
             log: VecDeque::new(),
             saved: session::load(),
         };
+        if app.settings.daemon {
+            if let Err(e) = daemon::set_enabled(true) {
+                app.log(format!("启动后台进程失败：{e}"));
+            }
+        }
         // Started by hand with nothing to show would look like it had not started.
         if app.windows.iter().any(|window| window.open) {
             if !app.windows[0].open {
@@ -918,7 +926,12 @@ impl App {
 
     fn poll_tray(&mut self, ctx: &egui::Context) {
         match tray::take_request() {
-            Some(tray::Request::Show) => self.show_all(),
+            Some(tray::Request::Show) => {
+                self.set_csp_minimized(false);
+                self.show_all();
+            }
+            Some(tray::Request::CspMinimized) => self.set_csp_minimized(true),
+            Some(tray::Request::CspRestored) => self.set_csp_minimized(false),
             Some(tray::Request::Settings) => self.settings_open = true,
             Some(tray::Request::Quit) => self.quit(ctx),
             Some(tray::Request::TogglePanel(panel)) => self.toggling.push(panel),
@@ -945,10 +958,29 @@ impl App {
         let open = self.windows.iter().filter(|window| window.open);
         let shown: Vec<Panel> = open.flat_map(|window| window.node.panels()).collect();
         tray::set_shown_panels(|panel| shown.contains(&panel));
-        platform::set_all_closed(shown.is_empty());
+        platform::set_all_closed(shown.is_empty() || self.csp_minimized);
+        if self.csp_minimized {
+            // Including a window that only came to exist just now.
+            self.cloak_open_windows(true);
+        }
         // With no tray to come back from, closing the last window can only mean leaving.
         if shown.is_empty() && self.tray.is_none() {
             self.quit(ctx);
+        }
+    }
+
+    fn set_csp_minimized(&mut self, minimized: bool) {
+        if minimized != self.csp_minimized {
+            self.csp_minimized = minimized;
+            self.cloak_open_windows(minimized);
+        }
+    }
+
+    fn cloak_open_windows(&self, cloaked: bool) {
+        let open = self.windows.iter().filter(|window| window.open);
+        for hwnd in open.filter_map(|window| window.hwnd) {
+            frame::set_cloaked(hwnd as _, cloaked);
+            frame::refresh_shadow(hwnd as _);
         }
     }
 
@@ -1881,6 +1913,15 @@ impl App {
             let mut shown = open.flat_map(|window| window.node.panels()).any(|other| other == panel);
             if switch(ui, &mut shown, panel_name(panel)).changed() {
                 self.toggling.push(panel);
+            }
+        }
+        ui.separator();
+
+        ui.label(RichText::new("后台").strong());
+        let hint = "开机后在后台运行一个没有界面的小进程，随 CSP 启动、最小化和关闭 Percepta";
+        if switch(ui, &mut self.settings.daemon, "跟随 CSP 启动、最小化和关闭").on_hover_text(hint).changed() {
+            if let Err(e) = daemon::set_enabled(self.settings.daemon) {
+                self.log(format!("设置后台进程失败：{e}"));
             }
         }
         ui.separator();

@@ -3,6 +3,7 @@
 mod app;
 mod color;
 mod csp;
+mod daemon;
 mod frame;
 mod icc;
 mod layout;
@@ -17,6 +18,10 @@ mod update;
 const ICON_SIZE: u32 = 256;
 
 fn main() -> eframe::Result {
+    if std::env::args().any(|argument| argument == daemon::ARGUMENT) {
+        daemon::run();
+        return Ok(());
+    }
     if tray::show_running_instance() {
         return Ok(());
     }

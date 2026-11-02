@@ -907,7 +907,7 @@ fn normalized(point: POINT, left: i32, top: i32, width: i32, height: i32) -> (i3
     (scale(point.x, left, width), scale(point.y, top, height))
 }
 
-fn process_image(pid: u32) -> Option<String> {
+pub fn process_image(pid: u32) -> Option<String> {
     let mut buffer = [0u16; 1024];
     let mut len = buffer.len() as u32;
     // SAFETY: `buffer` and `len` outlive the calls and `len` holds its capacity.
@@ -922,6 +922,10 @@ fn process_image(pid: u32) -> Option<String> {
         ok
     };
     (ok != 0).then(|| String::from_utf16_lossy(&buffer[..len as usize]))
+}
+
+pub fn is_csp_process(pid: u32) -> bool {
+    process_image(pid).is_some_and(|path| is_csp_image(&path))
 }
 
 /// The Simplified Chinese edition ships under the Udongman name.

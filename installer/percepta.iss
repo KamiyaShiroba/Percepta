@@ -52,28 +52,37 @@ Name: "{autodesktop}\Percepta"; Filename: "{app}\percepta.exe"; Tasks: desktopic
 
 [Code]
 const
-  // PerceptaTray and WM_APP + 2, as in src/tray.rs. An older version has no such window,
-  // and closes through CloseApplications instead.
+  // PerceptaTray and PerceptaDaemon, and WM_APP + 2, as in src/tray.rs and src/daemon.rs. An
+  // older version has no such windows, and closes through CloseApplications instead.
   QuitMessage = $8002;
   QuitWaitSteps = 50;
   QuitWaitStepMs = 100;
+  RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+  RunValue = 'Percepta Daemon';
 
-procedure QuitRunningPercepta;
+procedure QuitWindowOfClass(ClassName: String);
 var
   Window: HWND;
   Step, ResultCode: Integer;
 begin
-  Window := FindWindowByClassName('PerceptaTray');
+  Window := FindWindowByClassName(ClassName);
   if Window = 0 then
     Exit;
   PostMessage(Window, QuitMessage, 0, 0);
   for Step := 1 to QuitWaitSteps do
   begin
     Sleep(QuitWaitStepMs);
-    if FindWindowByClassName('PerceptaTray') = 0 then
+    if FindWindowByClassName(ClassName) = 0 then
       Exit;
   end;
   Exec('taskkill.exe', '/F /IM percepta.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure QuitRunningPercepta;
+begin
+  // The daemon first, which would otherwise start the app again.
+  QuitWindowOfClass('PerceptaDaemon');
+  QuitWindowOfClass('PerceptaTray');
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
@@ -85,6 +94,7 @@ end;
 function InitializeUninstall(): Boolean;
 begin
   QuitRunningPercepta;
+  RegDeleteValue(HKEY_CURRENT_USER, RunKey, RunValue);
   Result := True;
 end;
 

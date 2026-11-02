@@ -24,12 +24,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const WINDOW_CLASS: PCWSTR = w!("PerceptaTray");
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 /// installer/percepta.iss sends this number to make the running app exit.
-const QUIT_MESSAGE: u32 = WM_APP + 2;
+pub const QUIT_MESSAGE: u32 = WM_APP + 2;
 const SHOW_MESSAGE: u32 = WM_APP + 3;
 /// A window's own menu button, with where to open in `wparam` and `lparam`.
 const WINDOW_MENU_MESSAGE: u32 = WM_APP + 4;
 /// A module's title strip, likewise.
 const FLEXIBLE_MENU_MESSAGE: u32 = WM_APP + 5;
+/// From the daemon.
+pub const CSP_MINIMIZED_MESSAGE: u32 = WM_APP + 6;
+pub const CSP_RESTORED_MESSAGE: u32 = WM_APP + 7;
 const ICON_ID: u32 = 1;
 const ICON_SIZE: i32 = 32;
 const MENU_SHOW: usize = 1;
@@ -46,6 +49,8 @@ const REQUEST_QUIT: u8 = 3;
 /// Followed by the other panels, in the order of `PANELS`.
 const REQUEST_FIRST_PANEL: u8 = 4;
 const REQUEST_FLEXIBLE: u8 = 100;
+const REQUEST_CSP_MINIMIZED: u8 = 101;
+const REQUEST_CSP_RESTORED: u8 = 102;
 
 /// The last thing asked for through the tray, until the UI picks it up.
 static REQUEST: AtomicU8 = AtomicU8::new(REQUEST_NONE);
@@ -65,6 +70,8 @@ pub enum Request {
     Quit,
     TogglePanel(Panel),
     ToggleFlexible,
+    CspMinimized,
+    CspRestored,
 }
 
 /// Returns what the user asked for since the last call.
@@ -74,6 +81,8 @@ pub fn take_request() -> Option<Request> {
         REQUEST_SETTINGS => Some(Request::Settings),
         REQUEST_QUIT => Some(Request::Quit),
         REQUEST_FLEXIBLE => Some(Request::ToggleFlexible),
+        REQUEST_CSP_MINIMIZED => Some(Request::CspMinimized),
+        REQUEST_CSP_RESTORED => Some(Request::CspRestored),
         value => PANELS.get((value as usize).wrapping_sub(REQUEST_FIRST_PANEL as usize)).copied().map(Request::TogglePanel),
     }
 }
@@ -124,6 +133,19 @@ pub fn show_running_instance() -> bool {
         PostMessageW(running, SHOW_MESSAGE, 0, 0);
         true
     }
+}
+
+/// Whether Percepta itself is running, as seen from another process.
+pub fn is_running() -> bool {
+    // SAFETY: the class name is a static string, and a null title matches any.
+    !unsafe { FindWindowW(WINDOW_CLASS, ptr::null()) }.is_null()
+}
+
+/// Sends one of these messages to Percepta from another process.
+pub fn post(message: u32) {
+    // SAFETY: the class name is a static string. No pointers go with the message, and a
+    // missing window only makes it fail.
+    unsafe { PostMessageW(FindWindowW(WINDOW_CLASS, ptr::null()), message, 0, 0) };
 }
 
 pub struct Tray {
@@ -289,6 +311,8 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, message: u32, wparam: WPARAM, lp
         },
         QUIT_MESSAGE => request(REQUEST_QUIT),
         SHOW_MESSAGE => request(REQUEST_SHOW),
+        CSP_MINIMIZED_MESSAGE => request(REQUEST_CSP_MINIMIZED),
+        CSP_RESTORED_MESSAGE => request(REQUEST_CSP_RESTORED),
         WINDOW_MENU_MESSAGE => show_menu(hwnd, Some(POINT { x: wparam as i32, y: lparam as i32 })),
         FLEXIBLE_MENU_MESSAGE => show_flexible_menu(hwnd, POINT { x: wparam as i32, y: lparam as i32 }),
         _ if message == taskbar_created => add_icon(hwnd, ICON.load(Ordering::Relaxed) as HICON),

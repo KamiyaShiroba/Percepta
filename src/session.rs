@@ -84,11 +84,13 @@ pub struct SavedColors {
 pub struct SavedSettings {
     pub restore_csp: bool,
     pub check_updates: bool,
+    /// The background process that follows CSP.
+    pub daemon: bool,
 }
 
 impl Default for SavedSettings {
     fn default() -> Self {
-        Self { restore_csp: true, check_updates: true }
+        Self { restore_csp: true, check_updates: true, daemon: false }
     }
 }
 
