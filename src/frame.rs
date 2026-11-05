@@ -24,7 +24,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     ShowWindow, UpdateLayeredWindow, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOP,
     GWL_EXSTYLE, HTTOPLEFT, HTTOPRIGHT, HWND_TOPMOST, LWA_ALPHA, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
     SW_HIDE, ULW_ALPHA, WM_ACTIVATE, WM_APP, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_MOUSEMOVE, WM_NCDESTROY,
-    WM_MOVING, WM_NCHITTEST, WM_SIZING, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING, WINDOWPOS, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WM_MOVING, WM_NCACTIVATE, WM_NCHITTEST, WM_NCPAINT, WM_SETICON, WM_SETTEXT, WM_SIZING, GWL_STYLE, WS_VISIBLE, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING, WINDOWPOS, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TRANSPARENT, WS_POPUP,
 };
 
@@ -45,6 +45,11 @@ const BASE_DPI: f32 = 96.0;
 const SUBCLASS_ID: usize = 2;
 /// Not among the window messages that windows-sys lists with the others.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+/// Undocumented: ask a themed window to draw its caption and its frame.
+const WM_NCUAHDRAWCAPTION: u32 = 0x00AE;
+const WM_NCUAHDRAWFRAME: u32 = 0x00AF;
+/// Tells `DefWindowProc` to change a window's active state without redrawing its frame.
+const NCACTIVATE_NO_REDRAW: LPARAM = -1;
 /// Passes `caption_left` and `caption_right` to the window's frame, in `wparam` and `lparam`.
 const WM_SET_CAPTION_LEFT: u32 = WM_APP + 16;
 /// How opaque a window is while it is being dragged.
@@ -200,7 +205,7 @@ pub fn set_cloaked(hwnd: HWND, cloaked: bool) {
     unsafe { DwmSetWindowAttribute(hwnd, DWMWA_CLOAK as u32, (&raw const value).cast(), size_of::<BOOL>() as u32) };
 }
 
-fn is_cloaked(hwnd: HWND) -> bool {
+pub fn is_cloaked(hwnd: HWND) -> bool {
     let mut value = 0u32;
     // SAFETY: the pointer and size describe `value`, which stays 0 if the call fails.
     unsafe { DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED as u32, (&raw mut value).cast(), size_of::<u32>() as u32) };
@@ -333,6 +338,25 @@ unsafe extern "system" fn frame_proc(
             // do nothing, so make winit forget where the cursor was.
             // SAFETY: a message winit handles like any other move, with made-up coordinates.
             unsafe { DefSubclassProc(hwnd, WM_MOUSEMOVE, 0, -1) };
+        }
+        // The window keeps the caption style, for snapping and the system's move loop, and
+        // its region makes Windows draw that caption the classic way, straight over the UI.
+        // OpenGL does not present above it, so it would stay there until the next frame.
+        WM_NCPAINT | WM_NCUAHDRAWCAPTION | WM_NCUAHDRAWFRAME => return 0,
+        WM_NCACTIVATE => {
+            // SAFETY: forwards the message, with the documented value that skips the redraw.
+            return unsafe { DefSubclassProc(hwnd, message, wparam, NCACTIVATE_NO_REDRAW) };
+        }
+        WM_SETTEXT | WM_SETICON => {
+            // The default handling draws the caption at once, unless the window looks hidden.
+            // SAFETY: only the visible flag changes, and only for the length of the call.
+            unsafe {
+                let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_VISIBLE as isize));
+                let result = DefSubclassProc(hwnd, message, wparam, lparam);
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+                return result;
+            }
         }
         WM_ACTIVATE => {
             state.active = wparam & 0xFFFF != 0;

@@ -26,7 +26,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateIcon, DispatchMessageW, FindWindowW, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow,
     GetSystemMetrics, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic,
     IsWindowVisible, MessageBoxW, MsgWaitForMultipleObjects, PeekMessageW, MB_ICONERROR, MB_OK, SendMessageTimeoutW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, WindowFromPoint, EVENT_SYSTEM_FOREGROUND, GA_ROOTOWNER, GWL_EXSTYLE,
+    SetWindowLongPtrW, SetWindowPos, WindowFromPoint, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZESTART, GA_ROOT,
+    GA_ROOTOWNER, GWL_EXSTYLE, WINEVENT_SKIPOWNPROCESS,
     GW_HWNDNEXT, GW_HWNDPREV, HICON, HTCAPTION, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, MA_NOACTIVATE, MSG,
     PM_REMOVE, QS_ALLINPUT, SMTO_ABORTIFHUNG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN, STYLESTRUCT, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
@@ -46,6 +47,8 @@ static PREVIOUS_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
 static ORDINARY_WINDOW: AtomicBool = AtomicBool::new(false);
 /// Set by the foreground event, to wake the thread that keeps the window's level.
 static FOREGROUND_CHANGED: AtomicBool = AtomicBool::new(false);
+/// The window that last started to minimize, until the thread that keeps the level has looked.
+static MINIMIZING: AtomicIsize = AtomicIsize::new(0);
 /// Alternates the title bar click position so two quick clicks never count as a
 /// double-click, which would maximise CSP.
 static USE_SECOND_SPOT: AtomicBool = AtomicBool::new(false);
@@ -60,9 +63,15 @@ const HIT_TEST_TIMEOUT_MS: u32 = 50;
 const TITLE_BAR_PROBE: i32 = 20;
 const TOPMOST_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const TOPMOST_REASSERT_INTERVAL: Duration = Duration::from_millis(500);
+/// How soon to look again after raising the windows. Windows sometimes ignores the request for
+/// one of them, which would leave CSP over it until the next reassertion.
+const RAISE_RECHECK_DELAY: Duration = Duration::from_millis(20);
 /// How long the foreground must stay away from CSP before this window steps back.
 const TOPMOST_LOWER_DELAY: Duration = Duration::from_millis(120);
 const ORDINARY_SETTLE_TIME: Duration = Duration::from_secs(1);
+/// How long CSP is taken to be in front already, once it is the window that a minimize will
+/// bring there, before it really is.
+const CSP_EXPECTED_FOR: Duration = Duration::from_millis(400);
 /// Far enough apart to fall outside the system's double-click rectangle.
 const TITLE_SPOT_STEP: i32 = 24;
 const TITLE_ROW_STEP: i32 = 6;
@@ -303,6 +312,15 @@ impl PaletteWindow {
                     0,
                     WINEVENT_OUTOFCONTEXT,
                 );
+                SetWinEventHook(
+                    EVENT_SYSTEM_MINIMIZESTART,
+                    EVENT_SYSTEM_MINIMIZESTART,
+                    ptr::null_mut(),
+                    Some(minimize_started),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                );
             }
             let mut watch = ForegroundWatch::default();
             let mut topmost = false;
@@ -312,9 +330,14 @@ impl PaletteWindow {
             let mut mode = WindowMode::Ordinary;
             let mut applied_mode = WindowMode::FollowingCsp;
             let mut shown_at = Instant::now();
+            let mut expect_csp_until: Option<Instant> = None;
+            let mut just_raised = false;
             loop {
                 let waiting_to_leave = away_since.is_some() && mode == WindowMode::FollowingCsp;
-                wait_for_foreground_change(if waiting_to_leave {
+                let recheck = std::mem::take(&mut just_raised);
+                wait_for_foreground_change(if recheck {
+                    RAISE_RECHECK_DELAY
+                } else if waiting_to_leave {
                     TOPMOST_LOWER_DELAY
                 } else {
                     TOPMOST_CHECK_INTERVAL
@@ -335,7 +358,19 @@ impl PaletteWindow {
 
                 // The foreground passes through nothing while switching between CSP's own
                 // windows; leaving for that would make this window flicker.
-                let front = watch.classify();
+                let mut front = watch.classify();
+                // Minimizing the window just above these brings up the one just below. When that
+                // is CSP, it would cover them for a frame before the foreground event came, so
+                // they go up as soon as the minimize starts.
+                let minimizing = MINIMIZING.swap(0, Ordering::Relaxed) as HWND;
+                if !minimizing.is_null() && mode == WindowMode::Ordinary && csp_comes_next(minimizing) {
+                    expect_csp_until = Some(Instant::now() + CSP_EXPECTED_FOR);
+                }
+                if front == Front::Csp {
+                    expect_csp_until = None;
+                } else if expect_csp_until.is_some_and(|until| Instant::now() < until) && front != Front::Percepta {
+                    front = Front::Csp;
+                }
                 away_since = if front == Front::Other { away_since.or(Some(Instant::now())) } else { None };
                 let settled_away = away_since.is_some_and(|t| t.elapsed() >= TOPMOST_LOWER_DELAY);
                 mode = next_mode(mode, front, settled_away);
@@ -349,12 +384,16 @@ impl PaletteWindow {
                 }
 
                 let want_top = mode == WindowMode::FollowingCsp;
-                match topmost_action(want_top, topmost, last_assert.elapsed(), just_shown) {
+                // What was asked for is not always what happened. Checked once, right after
+                // raising, so that a window that never makes it cannot keep the order churning.
+                let all_top = topmost && (!recheck || guarded_windows().iter().all(|window| is_topmost(window.hwnd as HWND)));
+                match topmost_action(want_top, all_top, last_assert.elapsed(), just_shown) {
                     TopmostAction::None => {}
                     TopmostAction::Raise => {
                         raise_windows(hwnd);
                         topmost = true;
                         last_assert = Instant::now();
+                        just_raised = !recheck;
                     }
                     TopmostAction::Lower => {
                         for window in panel_windows() {
@@ -603,6 +642,57 @@ unsafe extern "system" fn foreground_changed(
     _time: u32,
 ) {
     FOREGROUND_CHANGED.store(true, Ordering::Relaxed);
+}
+
+unsafe extern "system" fn minimize_started(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    _object: i32,
+    _child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    MINIMIZING.store(hwnd as isize, Ordering::Relaxed);
+    FOREGROUND_CHANGED.store(true, Ordering::Relaxed);
+}
+
+/// Whether `minimizing` lies just above the windows that hold panels, with CSP just below them,
+/// so that CSP is what Windows will bring to the front once it is gone.
+fn csp_comes_next(minimizing: HWND) -> bool {
+    // SAFETY: a plain window query; a stale handle reads as not visible.
+    let visible = |window: HWND| unsafe { IsWindowVisible(window) } != 0;
+    let Some(ours) = panel_windows().into_iter().find(|&window| visible(window)) else { return false };
+    // SAFETY: plain window queries; a window that has vanished only reads as null.
+    let root = unsafe { GetAncestor(minimizing, GA_ROOT) };
+    let above = neighbour(ours, GW_HWNDPREV, |_| true);
+    // SAFETY: as above.
+    let below = neighbour(ours, GW_HWNDNEXT, |window| unsafe { IsIconic(window) } == 0);
+    above == Some(root) && below.is_some_and(|window| is_csp_process(window_process(window)))
+}
+
+/// The nearest window in `direction` that is on screen and not Percepta's own, and that `keep`
+/// accepts.
+fn neighbour(hwnd: HWND, direction: u32, keep: impl Fn(HWND) -> bool) -> Option<HWND> {
+    // SAFETY: plain Win32 queries. A window that vanishes during the walk ends it.
+    unsafe {
+        let own = GetCurrentProcessId();
+        let mut window = GetWindow(hwnd, direction);
+        while !window.is_null() {
+            if IsWindowVisible(window) != 0 && window_process(window) != own && !frame::is_cloaked(window) && keep(window) {
+                return Some(window);
+            }
+            window = GetWindow(window, direction);
+        }
+    }
+    None
+}
+
+fn window_process(hwnd: HWND) -> u32 {
+    let mut pid = 0;
+    // SAFETY: `pid` is valid for writes, and stays 0 for a window that is gone.
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    pid
 }
 
 /// Sleeps for up to `timeout`, waking early when the foreground window changes.

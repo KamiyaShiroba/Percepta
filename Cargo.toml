@@ -1,6 +1,6 @@
 [package]
 name = "percepta"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2021"
 description = "Colour picker for Clip Studio Paint, connected over Companion Mode"
 license = "MIT"
