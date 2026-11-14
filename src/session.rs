@@ -89,11 +89,19 @@ pub struct SavedSettings {
     pub daemon: bool,
     /// The code of a language, or `i18n::SYSTEM`.
     pub language: String,
+    /// The "Limit to sRGB" switch, which the wheel and the sliders share.
+    pub limit_to_srgb: bool,
 }
 
 impl Default for SavedSettings {
     fn default() -> Self {
-        Self { restore_csp: true, check_updates: true, daemon: false, language: i18n::SYSTEM.to_owned() }
+        Self {
+            restore_csp: true,
+            check_updates: true,
+            daemon: false,
+            language: i18n::SYSTEM.to_owned(),
+            limit_to_srgb: false,
+        }
     }
 }
 
@@ -184,6 +192,14 @@ mod tests {
         let old = r#"{"restore_csp":false,"check_updates":true,"close_action":"Quit"}"#;
         let settings: SavedSettings = serde_json::from_str(old).unwrap();
         assert!(!settings.restore_csp);
+        assert!(!settings.limit_to_srgb);
+    }
+
+    #[test]
+    fn the_srgb_limit_survives_saving() {
+        let settings = SavedSettings { limit_to_srgb: true, ..SavedSettings::default() };
+        let text = serde_json::to_string(&settings).unwrap();
+        assert_eq!(serde_json::from_str::<SavedSettings>(&text).unwrap(), settings);
     }
 
     #[test]

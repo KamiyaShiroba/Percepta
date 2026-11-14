@@ -587,6 +587,8 @@ impl App {
             log: VecDeque::new(),
             saved: session::load(),
         };
+        // The saved colours are within sRGB, so the limit changes nothing about them.
+        app.color.limit_to_srgb = app.settings.limit_to_srgb;
         for problem in i18n::problems() {
             app.log(problem.clone());
         }
@@ -620,6 +622,8 @@ impl App {
         if self.saved_layout.is_due(&layout, ctx) {
             self.save_layout(layout);
         }
+        // The switch belongs to the colour, which the panels change directly.
+        self.settings.limit_to_srgb = self.color.limit_to_srgb;
         if self.saved_settings.is_due(&self.settings, ctx) {
             self.save_settings();
         }
@@ -2178,6 +2182,7 @@ impl Drop for App {
         if layout != self.saved_layout.on_disk {
             self.save_layout(layout);
         }
+        self.settings.limit_to_srgb = self.color.limit_to_srgb;
         if self.settings != self.saved_settings.on_disk {
             self.save_settings();
         }
